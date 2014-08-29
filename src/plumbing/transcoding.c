@@ -24,6 +24,7 @@
 #include <libswresample/swresample.h>
 #include <libavutil/opt.h>
 #include <libavutil/mathematics.h>
+#include <libavutil/imgutils.h>
 #endif
 #include <libavutil/dict.h>
 #include <libavutil/audioconvert.h>
@@ -977,10 +978,6 @@ transcoder_stream_video(transcoder_stream_t *ts, th_pkt_t *pkt)
   }
       
  
-  len = avpicture_get_size(octx->pix_fmt, ictx->width, ictx->height);
-  out = av_malloc(len + FF_INPUT_BUFFER_PADDING_SIZE);
-  memset(out, 0, len);
-
   vs->vid_enc_frame->pkt_pts = vs->vid_dec_frame->pkt_pts;
   vs->vid_enc_frame->pkt_dts = vs->vid_dec_frame->pkt_dts;
 
@@ -989,8 +986,66 @@ transcoder_stream_video(transcoder_stream_t *ts, th_pkt_t *pkt)
 
   else if (ictx->coded_frame && ictx->coded_frame->pts != AV_NOPTS_VALUE)
     vs->vid_enc_frame->pts = vs->vid_dec_frame->pts;
- 
+
+#if LIBAVCODEC_VERSION_MAJOR < 54 || (LIBAVCODEC_VERSION_MAJOR == 54 && LIBAVCODEC_VERSION_MINOR < 25)
+  len = avpicture_get_size(octx->pix_fmt, ictx->width, ictx->height);
+  out = av_malloc(len + FF_INPUT_BUFFER_PADDING_SIZE);
+  memset(out, 0, len);
+
   length = avcodec_encode_video(octx, out, len, vs->vid_enc_frame);
+#else
+  AVPacket packet2;
+  int ret, got_output, frame_count;
+
+  av_init_packet(&packet2);
+  packet2.data = NULL; // packet data will be allocated by the encoder
+  packet2.size = 0;
+
+  ret = avcodec_encode_video2(octx, &packet2, vs->vid_enc_frame, &got_output);
+  if (ret < 0) {
+    tvhlog(LOG_ERR, "transcode", "Error encoding frame. avcodec_encode_video2()");
+    ts->ts_index = 0;
+    goto cleanup;
+  }
+  if (!got_output) {
+    tvhlog(LOG_ERR, "transcode", "No output from avcodec_encode_video2()");
+    ts->ts_index = 0;
+    goto cleanup;
+  }
+
+  length = packet2.size;
+
+  out = av_realloc(NULL, length + FF_INPUT_BUFFER_PADDING_SIZE);
+  memset(out, 0, length);
+
+  memcpy(out, packet2.data, packet2.size);
+
+  /* get the delayed frames */
+  av_free_packet(&packet2);
+  frame_count = 2;
+  for (got_output = 1; got_output; frame_count++) {
+    ret = avcodec_encode_video2(octx, &packet2, NULL, &got_output);
+
+    if (ret < 0) {
+      tvhlog(LOG_ERR, "transcode", "Error encoding delayed frames. avcodec_encode_video2()");
+      ts->ts_index = 0;
+      goto cleanup;
+    }
+
+    if (got_output) {
+      tvhlog(LOG_DEBUG, "transcode", "encoding frame %3d (size=%5d)\n", frame_count, packet2.size);
+
+      out = av_realloc(&out, length + packet2.size + FF_INPUT_BUFFER_PADDING_SIZE);
+      memset(out + length, 0, packet2.size);
+
+      // Expand out to be able to contain all data.
+      memcpy(out+length, packet2.data, packet2.size);
+      length =+ packet2.size;
+      av_free_packet(&packet2);
+    }
+  }
+#endif
+
   if (length <= 0) {
     if (length) {
       tvhlog(LOG_ERR, "transcode", "Unable to encode video (%d)", length);
