@@ -655,7 +655,7 @@ transcoder_stream_audio(transcoder_stream_t *ts, th_pkt_t *pkt)
   m_iBufferSize1 = av_samples_get_buffer_size(NULL, ictx->channels, frame1->nb_samples, ictx->sample_fmt, 1);
   tvhlog(LOG_DEBUG, "transcode", "decoded: m_iBufferSize1=%d, frame1->nb_samples=%d\n", m_iBufferSize1, frame1->nb_samples);
 
-  int out_samples;
+  //int out_samples;
 
   av_free_packet(&packet);
   if ((ictx->channels != octx->channels) ||
@@ -711,7 +711,7 @@ transcoder_stream_audio(transcoder_stream_t *ts, th_pkt_t *pkt)
                                    octx->channels,
                                    frame1->nb_samples,
                                    octx->sample_fmt, 0)) < 0) {
-      tvhlog(LOG_ERR, "transcode", "Could not allocate converted input samples (error '%s')",get_error_text(error));
+      tvhlog(LOG_ERR, "transcode", "Could not allocate converted input samples (error '%s')",get_error_text(conv_error));
       av_freep(&(*converted_input_samples)[0]);
       free(*converted_input_samples);
 
@@ -721,7 +721,7 @@ transcoder_stream_audio(transcoder_stream_t *ts, th_pkt_t *pkt)
 
     if ((conv_error = avresample_convert(resample_context, converted_input_samples, 0,
                                          frame1->nb_samples, frame1->extended_data, 0, frame1->nb_samples)) < 0) {
-      tvhlog(LOG_ERR, "transcode", "Could not do avresample_convert() (error '%s')",get_error_text(error));
+      tvhlog(LOG_ERR, "transcode", "Could not do avresample_convert() (error '%s')",get_error_text(conv_error));
       av_freep(&(*converted_input_samples)[0]);
       free(*converted_input_samples);
       av_freep(&output);
@@ -759,7 +759,7 @@ transcoder_stream_audio(transcoder_stream_t *ts, th_pkt_t *pkt)
     av_init_packet(&packet);
     packet.data = frame1->data[0];
     packet.size = m_iBufferSize1;
-    out_samples = frame1->nb_samples;
+    //out_samples = frame1->nb_samples;
   }
 
   if ((as->aud_dec_size - as->aud_dec_offset - packet.size) <= 0) {
