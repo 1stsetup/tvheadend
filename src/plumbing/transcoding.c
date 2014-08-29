@@ -707,7 +707,7 @@ transcoder_stream_audio(transcoder_stream_t *ts, th_pkt_t *pkt)
     }
 
     int conv_error;
-    if ((conv_error = av_samples_alloc(&converted_input_samples, NULL,
+    if ((conv_error = av_samples_alloc(converted_input_samples, NULL,
                                    octx->channels,
                                    frame1->nb_samples,
                                    octx->sample_fmt, 0)) < 0) {
@@ -719,7 +719,6 @@ transcoder_stream_audio(transcoder_stream_t *ts, th_pkt_t *pkt)
       goto cleanup;
     }
 
-    if (convert_samples(frame1->extended_data, converted_input_samples, frame1->nb_samples, resample_context)) {
     if ((conv_error = avresample_convert(resample_context, converted_input_samples, 0,
                                          frame1->nb_samples, frame1->extended_data, 0, frame1->nb_samples)) < 0) {
       tvhlog(LOG_ERR, "transcode", "Could not do avresample_convert() (error '%s')",get_error_text(error));
