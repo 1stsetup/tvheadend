@@ -707,7 +707,6 @@ transcoder_stream_audio(transcoder_stream_t *ts, th_pkt_t *pkt)
     }
 
     int conv_error;
-    if (init_converted_samples(&converted_input_samples, octx, frame1->nb_samples)) {
     if ((conv_error = av_samples_alloc(&converted_input_samples, NULL,
                                    octx->channels,
                                    frame1->nb_samples,
