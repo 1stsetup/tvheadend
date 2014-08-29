@@ -21,7 +21,7 @@
 #include <libavcodec/avcodec.h>
 #include <libswscale/swscale.h>
 #if LIBAVCODEC_VERSION_MAJOR > 54 || (LIBAVCODEC_VERSION_MAJOR == 54 && LIBAVCODEC_VERSION_MINOR >= 25)
-#include <libswresample/swresample.h>
+#include <"libavresample/avresample.h">
 #include <libavutil/opt.h>
 #include <libavutil/mathematics.h>
 #include <libavutil/imgutils.h>
@@ -667,24 +667,43 @@ transcoder_stream_audio(transcoder_stream_t *ts, th_pkt_t *pkt)
     tvhlog(LOG_DEBUG, "transcode", "octx->sample_fmt:%d", octx->sample_fmt);
 
     uint8_t *output = NULL;
-    SwrContext *swr = NULL;
+    AVAudioResampleContext *resample_context = NULL;
 
-    swr = swr_alloc();
+    if (!(resample_context = avresample_alloc_context())) {
+      tvhlog(LOG_ERR, "transcode", "Could not allocate resample context");
+      ts->ts_index = 0;
+      goto cleanup;
+    }
 
-    av_opt_set_int(swr, "in_channel_layout", ictx->channel_layout, 0);
-    av_opt_set_int(swr, "out_channel_layout", octx->channel_layout, 0);
-    av_opt_set_int(swr, "in_sample_rate", ictx->sample_rate, 0);
-    av_opt_set_int(swr, "out_sample_rate", octx->sample_rate, 0);
-    av_opt_set_int(swr, "in_sample_fmt", ictx->sample_fmt, 0);  // Not supported in libav
-    av_opt_set_int(swr, "out_sample_fmt", octx->sample_fmt, 0);  // av_opt_set_sample_fmt Not supported in libav
-    if (swr_init(swr) < 0) {
-			tvhlog(LOG_ERR, "transcode", "Error swr_init.\n");
+    av_opt_set_int(resample_context, "in_channel_layout", av_get_default_channel_layout(ictx->channels), 0);
+    av_opt_set_int(resample_context, "out_channel_layout", av_get_default_channel_layout(octx->channels), 0);
+    av_opt_set_int(resample_context, "in_sample_rate", ictx->sample_rate, 0);
+    av_opt_set_int(resample_context, "out_sample_rate", octx->sample_rate, 0);
+    av_opt_set_int(resample_context, "in_sample_fmt", ictx->sample_fmt, 0);  // Not supported in libav
+    av_opt_set_int(resample_context, "out_sample_fmt", octx->sample_fmt, 0);  // av_opt_set_sample_fmt Not supported in libav
+    if (avresample_open(resample_context) < 0) {
+			tvhlog(LOG_ERR, "transcode", "Error avresample_open.\n");
+                        avresample_free(&resample_context);
 			goto cleanup;
     }
 
+    uint8_t **converted_input_samples = NULL;
     int in_samples = frame1->nb_samples;
     tvhlog(LOG_DEBUG, "transcode", "converted: in_samples=%d\n", in_samples);
-    out_samples = av_rescale_rnd(swr_get_delay(swr, octx->sample_rate) + in_samples, octx->sample_rate, octx->sample_rate, AV_ROUND_UP);
+
+    if (init_converted_samples(&converted_input_samples, octx, frame1->nb_samples)) {
+			tvhlog(LOG_ERR, "transcode", "Error init_converted_samples.\n");
+			av_freep(&output);
+			goto cleanup;
+    }
+
+    if (convert_samples(frame1->extended_data, converted_input_samples, frame1->nb_samples, resample_context)) {
+			tvhlog(LOG_ERR, "transcode", "Error convert_samples.\n");
+			av_freep(&output);
+			goto cleanup;
+    }
+
+/*    out_samples = av_rescale_rnd(swr_get_delay(swr, octx->sample_rate) + in_samples, octx->sample_rate, octx->sample_rate, AV_ROUND_UP);
     av_samples_alloc(&output, NULL, octx->channels, out_samples, octx->sample_fmt, 0);
     out_samples = swr_convert(swr, &output, out_samples, (const uint8_t **)&frame1->data[0], in_samples);
     if (out_samples < 0) {
@@ -695,10 +714,12 @@ transcoder_stream_audio(transcoder_stream_t *ts, th_pkt_t *pkt)
 
     m_iBufferSize1 = av_samples_get_buffer_size(NULL, octx->channels, out_samples, octx->sample_fmt, 1);
     tvhlog(LOG_DEBUG, "transcode", "converted: m_iBufferSize1=%d, out_samples=%d\n", m_iBufferSize1, out_samples);
-
+*/
     av_init_packet(&packet);
-    packet.data = output;
-    packet.size = m_iBufferSize1;
+//    packet.data = output;
+//    packet.size = m_iBufferSize1;
+    packet.data = *converted_input_samples;
+    packet.size = frame1->nb_samples;
   }
   else {
     tvhlog(LOG_DEBUG, "transcode", "No conversion needed");
