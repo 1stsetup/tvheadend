@@ -21,10 +21,11 @@
 #include <libavcodec/avcodec.h>
 #include <libswscale/swscale.h>
 #if LIBAVCODEC_VERSION_MAJOR > 54 || (LIBAVCODEC_VERSION_MAJOR == 54 && LIBAVCODEC_VERSION_MINOR >= 25)
-#include <"libavresample/avresample.h">
+#include <libavresample/avresample.h>
 #include <libavutil/opt.h>
 #include <libavutil/mathematics.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/frame.h>
 #endif
 #include <libavutil/dict.h>
 #include <libavutil/audioconvert.h>
@@ -459,6 +460,14 @@ transcoder_stream_audio(transcoder_stream_t *ts, th_pkt_t *pkt)
   pkt_ref_dec(pkt);
 }
 #else
+
+static char *const get_error_text(const int error)
+{
+  static char error_buffer[255];
+  av_strerror(error, error_buffer, sizeof(error_buffer));
+  return error_buffer;
+}
+
 /**
  *
  */
@@ -691,18 +700,44 @@ transcoder_stream_audio(transcoder_stream_t *ts, th_pkt_t *pkt)
     int in_samples = frame1->nb_samples;
     tvhlog(LOG_DEBUG, "transcode", "converted: in_samples=%d\n", in_samples);
 
+    if (!(converted_input_samples = calloc(octx->channels, sizeof(**converted_input_samples)))) {
+      tvhlog(LOG_ERR, "transcode", "Error init_converted_samples - calloc.\n");
+      av_freep(&output);
+      goto cleanup;
+    }
+
+    int conv_error;
     if (init_converted_samples(&converted_input_samples, octx, frame1->nb_samples)) {
-			tvhlog(LOG_ERR, "transcode", "Error init_converted_samples.\n");
-			av_freep(&output);
-			goto cleanup;
+    if ((conv_error = av_samples_alloc(&converted_input_samples, NULL,
+                                   octx->channels,
+                                   frame1->nb_samples,
+                                   octx->sample_fmt, 0)) < 0) {
+      tvhlog(LOG_ERR, "transcode", "Could not allocate converted input samples (error '%s')",get_error_text(error));
+      av_freep(&(*converted_input_samples)[0]);
+      free(*converted_input_samples);
+
+      av_freep(&output);
+      goto cleanup;
     }
 
     if (convert_samples(frame1->extended_data, converted_input_samples, frame1->nb_samples, resample_context)) {
-			tvhlog(LOG_ERR, "transcode", "Error convert_samples.\n");
-			av_freep(&output);
-			goto cleanup;
+    if ((conv_error = avresample_convert(resample_context, converted_input_samples, 0,
+                                         frame1->nb_samples, frame1->extended_data, 0, frame1->nb_samples)) < 0) {
+      tvhlog(LOG_ERR, "transcode", "Could not do avresample_convert() (error '%s')",get_error_text(error));
+      av_freep(&(*converted_input_samples)[0]);
+      free(*converted_input_samples);
+      av_freep(&output);
+      goto cleanup;
     }
 
+    if (avresample_available(resample_context)) {
+      fprintf(stderr, "Converted samples left over\n");
+      tvhlog(LOG_ERR, "transcode", "Converted samples left over in audio converter.");
+      av_freep(&(*converted_input_samples)[0]);
+      free(*converted_input_samples);
+      av_freep(&output);
+      goto cleanup;
+    }
 /*    out_samples = av_rescale_rnd(swr_get_delay(swr, octx->sample_rate) + in_samples, octx->sample_rate, octx->sample_rate, AV_ROUND_UP);
     av_samples_alloc(&output, NULL, octx->channels, out_samples, octx->sample_fmt, 0);
     out_samples = swr_convert(swr, &output, out_samples, (const uint8_t **)&frame1->data[0], in_samples);
