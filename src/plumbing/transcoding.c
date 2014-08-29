@@ -25,7 +25,7 @@
 #include <libavutil/opt.h>
 #include <libavutil/mathematics.h>
 #include <libavutil/imgutils.h>
-//#include <libavutil/frame.h>
+#include <libavutil/frame.h>
 #endif
 #include <libavutil/dict.h>
 #include <libavutil/audioconvert.h>
