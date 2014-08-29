@@ -392,6 +392,7 @@ transcoder_stream_audio(transcoder_stream_t *ts, th_pkt_t *pkt)
     octx->flags         |= CODEC_FLAG_GLOBAL_HEADER;
     octx->channels       = 2; // Only stereo suported by libavcodec
     octx->global_quality = 4*FF_QP2LAMBDA;
+
     break;
 
   default:
@@ -507,9 +508,9 @@ transcoder_stream_audio(transcoder_stream_t *ts, th_pkt_t *pkt)
   av_init_packet(&packet);
   packet.data     = pktbuf_ptr(pkt->pkt_payload);
   packet.size     = pktbuf_len(pkt->pkt_payload);
-//  packet.pts      = pkt->pkt_pts;
-//  packet.dts      = pkt->pkt_dts;
-//  packet.duration = pkt->pkt_duration;
+  packet.pts      = pkt->pkt_pts;
+  packet.dts      = pkt->pkt_dts;
+  packet.duration = pkt->pkt_duration;
 
   if ((len = as->aud_dec_size - as->aud_dec_offset) <= 0) {
     tvhlog(LOG_ERR, "transcode", "Decoder buffer overflow");
@@ -550,7 +551,7 @@ transcoder_stream_audio(transcoder_stream_t *ts, th_pkt_t *pkt)
   }
 */
 
-  as->aud_dec_pts    += pkt->pkt_duration;
+//  as->aud_dec_pts    += pkt->pkt_duration;
 //  as->aud_dec_offset += len;
 
 
@@ -621,8 +622,11 @@ transcoder_stream_audio(transcoder_stream_t *ts, th_pkt_t *pkt)
   case SCT_VORBIS:
     octx->flags         |= CODEC_FLAG_QSCALE;
     octx->flags         |= CODEC_FLAG_GLOBAL_HEADER;
-    octx->channels       = 2; // Only stereo suported by libavcodec
+    //octx->channels       = 2; // Only stereo suported by libavcodec
     octx->global_quality = 4*FF_QP2LAMBDA;
+    octx->sample_fmt     = AV_SAMPLE_FMT_FLTP;
+    octx->channels       = ictx->channels;
+    octx->channel_layout = ictx->channel_layout;
     break;
 
   default:
@@ -642,11 +646,26 @@ transcoder_stream_audio(transcoder_stream_t *ts, th_pkt_t *pkt)
   m_iBufferSize1 = av_samples_get_buffer_size(NULL, ictx->channels, frame1->nb_samples, ictx->sample_fmt, 1);
   tvhlog(LOG_DEBUG, "transcode", "decoded: m_iBufferSize1=%d, frame1->nb_samples=%d\n", m_iBufferSize1, frame1->nb_samples);
 
+  int out_samples;
+
+  av_free_packet(&packet);
   if ((ictx->channels != octx->channels) ||
       (ictx->channel_layout != octx->channel_layout) ||
       (ictx->sample_fmt != octx->sample_fmt) ||
       (ictx->sample_rate != octx->sample_rate)) {
     // Convert audio
+    tvhlog(LOG_DEBUG, "transcode", "converting audio");
+
+    tvhlog(LOG_DEBUG, "transcode", "ictx->channels:%d", ictx->channels);
+    tvhlog(LOG_DEBUG, "transcode", "ictx->channel_layout:%" PRIu64, ictx->channel_layout);
+    tvhlog(LOG_DEBUG, "transcode", "ictx->sample_rate:%d", ictx->sample_rate);
+    tvhlog(LOG_DEBUG, "transcode", "ictx->sample_fmt:%d", ictx->sample_fmt);
+
+    tvhlog(LOG_DEBUG, "transcode", "octx->channels:%d", octx->channels);
+    tvhlog(LOG_DEBUG, "transcode", "octx->channel_layout:%" PRIu64, octx->channel_layout);
+    tvhlog(LOG_DEBUG, "transcode", "octx->sample_rate:%d", octx->sample_rate);
+    tvhlog(LOG_DEBUG, "transcode", "octx->sample_fmt:%d", octx->sample_fmt);
+
     uint8_t *output = NULL;
     SwrContext *swr = NULL;
 
@@ -664,7 +683,8 @@ transcoder_stream_audio(transcoder_stream_t *ts, th_pkt_t *pkt)
     }
 
     int in_samples = frame1->nb_samples;
-    int out_samples = av_rescale_rnd(swr_get_delay(swr, octx->sample_rate) + in_samples, octx->sample_rate, octx->sample_rate, AV_ROUND_UP);
+    tvhlog(LOG_DEBUG, "transcode", "converted: in_samples=%d\n", in_samples);
+    out_samples = av_rescale_rnd(swr_get_delay(swr, octx->sample_rate) + in_samples, octx->sample_rate, octx->sample_rate, AV_ROUND_UP);
     av_samples_alloc(&output, NULL, octx->channels, out_samples, octx->sample_fmt, 0);
     out_samples = swr_convert(swr, &output, out_samples, (const uint8_t **)&frame1->data[0], in_samples);
     if (out_samples < 0) {
@@ -681,9 +701,11 @@ transcoder_stream_audio(transcoder_stream_t *ts, th_pkt_t *pkt)
     packet.size = m_iBufferSize1;
   }
   else {
+    tvhlog(LOG_DEBUG, "transcode", "No conversion needed");
     av_init_packet(&packet);
     packet.data = frame1->data[0];
     packet.size = m_iBufferSize1;
+    out_samples = frame1->nb_samples;
   }
 
   if ((as->aud_dec_size - as->aud_dec_offset - packet.size) <= 0) {
@@ -695,31 +717,40 @@ transcoder_stream_audio(transcoder_stream_t *ts, th_pkt_t *pkt)
   // Write to buffer
   samples = (short*)(as->aud_dec_sample + as->aud_dec_offset);
   memcpy(samples, packet.data, packet.size);
+  as->aud_dec_offset =+ packet.size;
+  as->aud_dec_pts    += pkt->pkt_duration;
   av_free_packet(&packet);
 
-/*  frame_bytes = av_get_bytes_per_sample(octx->sample_fmt) *
+  frame_bytes = av_get_bytes_per_sample(octx->sample_fmt) *
     octx->frame_size *
     octx->channels;
-*/
+/*
   frame_bytes = av_samples_get_buffer_size(NULL, octx->channels, octx->frame_size,
                                                octx->sample_fmt, 0);
+*/
 
   len = as->aud_dec_offset;
+     tvhlog(LOG_DEBUG, "transcode", "converted: len=%d, frame_bytes=%d", len, frame_bytes);
 
   for (i = 0; i <= (len - frame_bytes); i += frame_bytes) {
+     tvhlog(LOG_DEBUG, "transcode", "converted: i=%d, (len - frame_bytes)=%d", i, (len - frame_bytes));
     av_frame_free(&frame1);
     frame1 = av_frame_alloc();
     frame1->nb_samples = octx->frame_size;
+//    frame1->nb_samples = out_samples;
     frame1->format = octx->sample_fmt;
     frame1->channel_layout = octx->channel_layout;
 
-    if (avcodec_fill_audio_frame(frame1, octx->channels, octx->sample_fmt, (const uint8_t*)(as->aud_dec_sample + i), frame_bytes, 0) < 0) {
+    int ret = avcodec_fill_audio_frame(frame1, octx->channels, octx->sample_fmt, (const uint8_t*)(as->aud_dec_sample + i), frame_bytes, 0);
+    if (ret < 0) {
       tvhlog(LOG_ERR, "transcode", "Failed avcodec_fill_audio_frame().");
       ts->ts_index = 0;
       goto cleanup;
     }
 
-    int ret = avcodec_encode_audio2(octx,
+    packet.data = NULL; // packet data will be allocated by the encoder
+    packet.size = 0;
+    ret = avcodec_encode_audio2(octx,
                                    &packet,
                                    frame1,
                                    &got_packet_ptr);
@@ -728,8 +759,8 @@ transcoder_stream_audio(transcoder_stream_t *ts, th_pkt_t *pkt)
 				  as->aud_enc_size,
 				  (short *)(as->aud_dec_sample + i));
 */
-    if ((ret < 0) || (!got_packet_ptr)) {
-      tvhlog(LOG_ERR, "transcode", "Unable to encode audio (%d:%d)", length, got_packet_ptr);
+    if ((ret < 0) || (got_packet_ptr < -1)) {
+      tvhlog(LOG_ERR, "transcode", "Unable to encode audio (%d:%d)(i=%d)", ret, got_packet_ptr, i);
       ts->ts_index = 0;
       goto cleanup;
 
