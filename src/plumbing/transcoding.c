@@ -72,6 +72,8 @@ typedef struct audio_stream {
 
   int8_t          aud_channels;
   int32_t         aud_bitrate;
+  AVAudioResampleContext *resample_context;
+
 } audio_stream_t;
 
 
@@ -486,7 +488,8 @@ transcoder_stream_audio(transcoder_stream_t *ts, th_pkt_t *pkt)
   int got_frame, got_packet_ptr;
   AVFrame *frame1 = av_frame_alloc();
   int m_iBufferSize1;
-
+  uint8_t **converted_input_samples = NULL;
+  uint8_t *output;
 
   ictx = as->aud_ictx;
   octx = as->aud_octx;
@@ -531,7 +534,9 @@ transcoder_stream_audio(transcoder_stream_t *ts, th_pkt_t *pkt)
                                  , frame1
                                  , &got_frame
                                  , &packet);
-  tvhlog(LOG_DEBUG, "transcode", "Decoded packet. length=%d from packet.size=%zu.\n", length, pktbuf_len(pkt->pkt_payload));
+  av_free_packet(&packet);
+
+  tvhlog(LOG_DEBUG, "transcode", "Decoded packet. length-consumed=%d from in-length=%zu.\n", length, pktbuf_len(pkt->pkt_payload));
 
   if (!got_frame) {
     tvhlog(LOG_DEBUG, "transcode", "Did not have a full frame in the packet.\n");
@@ -551,14 +556,6 @@ transcoder_stream_audio(transcoder_stream_t *ts, th_pkt_t *pkt)
     ts->ts_index = 0;
     goto cleanup;
   }
-
-/*  samples = (short*)(as->aud_dec_sample + as->aud_dec_offset);
-  if ((length = avcodec_decode_audio3(ictx, samples, &len, &packet)) <= 0) {
-    tvhlog(LOG_ERR, "transcode", "Unable to decode audio (%d)", length);
-    ts->ts_index = 0;
-    goto cleanup;
-  }
-*/
 
 //  as->aud_dec_pts    += pkt->pkt_duration;
 //  as->aud_dec_offset += len;
@@ -621,6 +618,17 @@ transcoder_stream_audio(transcoder_stream_t *ts, th_pkt_t *pkt)
     else
       octx->channel_layout = AV_CH_LAYOUT_STEREO;
 
+    octx->sample_fmt     = AV_SAMPLE_FMT_S16;
+    octx->bit_rate = 128;
+    tvhlog(LOG_DEBUG, "transcode", "ictx->channels:%d", ictx->channels);
+    tvhlog(LOG_DEBUG, "transcode", "ictx->channel_layout:%" PRIu64, ictx->channel_layout);
+    tvhlog(LOG_DEBUG, "transcode", "ictx->sample_rate:%d", ictx->sample_rate);
+    tvhlog(LOG_DEBUG, "transcode", "ictx->sample_fmt:%d", ictx->sample_fmt);
+
+    tvhlog(LOG_DEBUG, "transcode", "octx->channels:%d", octx->channels);
+    tvhlog(LOG_DEBUG, "transcode", "octx->channel_layout:%" PRIu64, octx->channel_layout);
+    tvhlog(LOG_DEBUG, "transcode", "octx->sample_rate:%d", octx->sample_rate);
+    tvhlog(LOG_DEBUG, "transcode", "octx->sample_fmt:%d", octx->sample_fmt);
     break;
 
   case SCT_AAC:
@@ -642,6 +650,11 @@ transcoder_stream_audio(transcoder_stream_t *ts, th_pkt_t *pkt)
     break;
   }
 
+  int resample = ((ictx->channels != octx->channels) ||
+      (ictx->channel_layout != octx->channel_layout) ||
+      (ictx->sample_fmt != octx->sample_fmt) ||
+      (ictx->sample_rate != octx->sample_rate));
+
   if (octx->codec_id == AV_CODEC_ID_NONE) {
     octx->codec_id = ocodec->id;
 
@@ -650,120 +663,106 @@ transcoder_stream_audio(transcoder_stream_t *ts, th_pkt_t *pkt)
       ts->ts_index = 0;
       goto cleanup;
     }
+
+    as->resample_context = NULL;
+    if (resample) {
+      if (!(as->resample_context = avresample_alloc_context())) {
+        tvhlog(LOG_ERR, "transcode", "Could not allocate resample context");
+        ts->ts_index = 0;
+        goto cleanup;
+      }
+
+      // Convert audio
+      tvhlog(LOG_DEBUG, "transcode", "converting audio");
+
+      tvhlog(LOG_DEBUG, "transcode", "ictx->channels:%d", ictx->channels);
+      tvhlog(LOG_DEBUG, "transcode", "ictx->channel_layout:%" PRIu64, ictx->channel_layout);
+      tvhlog(LOG_DEBUG, "transcode", "ictx->sample_rate:%d", ictx->sample_rate);
+      tvhlog(LOG_DEBUG, "transcode", "ictx->sample_fmt:%d", ictx->sample_fmt);
+
+      tvhlog(LOG_DEBUG, "transcode", "octx->channels:%d", octx->channels);
+      tvhlog(LOG_DEBUG, "transcode", "octx->channel_layout:%" PRIu64, octx->channel_layout);
+      tvhlog(LOG_DEBUG, "transcode", "octx->sample_rate:%d", octx->sample_rate);
+      tvhlog(LOG_DEBUG, "transcode", "octx->sample_fmt:%d", octx->sample_fmt);
+
+      int opt_error;
+      if ((opt_error = av_opt_set_int(as->resample_context, "in_channel_layout", av_get_default_channel_layout(ictx->channels), 0)) != 0) {
+        tvhlog(LOG_ERR, "transcode", "Could not set option in_channel_layout (error '%s')",get_error_text(opt_error));
+      }
+      if ((opt_error = av_opt_set_int(as->resample_context, "out_channel_layout", av_get_default_channel_layout(octx->channels), 0)) != 0) {
+        tvhlog(LOG_ERR, "transcode", "Could not set option out_channel_layout (error '%s')",get_error_text(opt_error));
+      }
+      if ((opt_error = av_opt_set_int(as->resample_context, "in_sample_rate", ictx->sample_rate, 0)) != 0) {
+        tvhlog(LOG_ERR, "transcode", "Could not set option in_sample_rate (error '%s')",get_error_text(opt_error));
+      }
+      if ((opt_error = av_opt_set_int(as->resample_context, "out_sample_rate", octx->sample_rate, 0)) != 0) {
+        tvhlog(LOG_ERR, "transcode", "Could not set option out_sample_rate (error '%s')",get_error_text(opt_error));
+      }
+      if ((opt_error = av_opt_set_int(as->resample_context, "in_sample_fmt", ictx->sample_fmt, 0)) != 0) {
+        tvhlog(LOG_ERR, "transcode", "Could not set option in_sample_fmt (error '%s')",get_error_text(opt_error));
+      }
+      if ((opt_error = av_opt_set_int(as->resample_context, "out_sample_fmt", octx->sample_fmt, 0)) != 0) {
+        tvhlog(LOG_ERR, "transcode", "Could not set option out_sample_fmt (error '%s')",get_error_text(opt_error));
+      }
+
+      if (avresample_open(as->resample_context) < 0) {
+	  		tvhlog(LOG_ERR, "transcode", "Error avresample_open.\n");
+  			goto cleanup;
+      }
+
+    }
   }
 
-  m_iBufferSize1 = av_samples_get_buffer_size(NULL, ictx->channels, frame1->nb_samples, ictx->sample_fmt, 1);
-  tvhlog(LOG_DEBUG, "transcode", "decoded: m_iBufferSize1=%d, frame1->nb_samples=%d\n", m_iBufferSize1, frame1->nb_samples);
+  int out_samples;
 
-  //int out_samples;
+  if (resample) {
 
-  av_free_packet(&packet);
-  if ((ictx->channels != octx->channels) ||
-      (ictx->channel_layout != octx->channel_layout) ||
-      (ictx->sample_fmt != octx->sample_fmt) ||
-      (ictx->sample_rate != octx->sample_rate)) {
-    // Convert audio
-    tvhlog(LOG_DEBUG, "transcode", "converting audio");
-
-    tvhlog(LOG_DEBUG, "transcode", "ictx->channels:%d", ictx->channels);
-    tvhlog(LOG_DEBUG, "transcode", "ictx->channel_layout:%" PRIu64, ictx->channel_layout);
-    tvhlog(LOG_DEBUG, "transcode", "ictx->sample_rate:%d", ictx->sample_rate);
-    tvhlog(LOG_DEBUG, "transcode", "ictx->sample_fmt:%d", ictx->sample_fmt);
-
-    tvhlog(LOG_DEBUG, "transcode", "octx->channels:%d", octx->channels);
-    tvhlog(LOG_DEBUG, "transcode", "octx->channel_layout:%" PRIu64, octx->channel_layout);
-    tvhlog(LOG_DEBUG, "transcode", "octx->sample_rate:%d", octx->sample_rate);
-    tvhlog(LOG_DEBUG, "transcode", "octx->sample_fmt:%d", octx->sample_fmt);
-
-    uint8_t *output = NULL;
-    AVAudioResampleContext *resample_context = NULL;
-
-    if (!(resample_context = avresample_alloc_context())) {
-      tvhlog(LOG_ERR, "transcode", "Could not allocate resample context");
-      ts->ts_index = 0;
-      goto cleanup;
-    }
-
-    av_opt_set_int(resample_context, "in_channel_layout", av_get_default_channel_layout(ictx->channels), 0);
-    av_opt_set_int(resample_context, "out_channel_layout", av_get_default_channel_layout(octx->channels), 0);
-    av_opt_set_int(resample_context, "in_sample_rate", ictx->sample_rate, 0);
-    av_opt_set_int(resample_context, "out_sample_rate", octx->sample_rate, 0);
-    av_opt_set_int(resample_context, "in_sample_fmt", ictx->sample_fmt, 0);  // Not supported in libav
-    av_opt_set_int(resample_context, "out_sample_fmt", octx->sample_fmt, 0);  // av_opt_set_sample_fmt Not supported in libav
-    if (avresample_open(resample_context) < 0) {
-			tvhlog(LOG_ERR, "transcode", "Error avresample_open.\n");
-                        avresample_free(&resample_context);
-			goto cleanup;
-    }
-
-    uint8_t **converted_input_samples = NULL;
     int in_samples = frame1->nb_samples;
-    tvhlog(LOG_DEBUG, "transcode", "converted: in_samples=%d\n", in_samples);
+    tvhlog(LOG_DEBUG, "transcode", "converted: in_samples=%d", in_samples);
 
-    if (!(converted_input_samples = calloc(octx->channels, sizeof(**converted_input_samples)))) {
-      tvhlog(LOG_ERR, "transcode", "Error init_converted_samples - calloc.\n");
-      av_freep(&output);
-      goto cleanup;
-    }
-
+    int in_linesize = 0;
+    int out_linesize;
+    out_samples = avresample_get_out_samples(as->resample_context, in_samples);
     int conv_error;
-    if ((conv_error = av_samples_alloc(converted_input_samples, NULL,
-                                   octx->channels,
-                                   frame1->nb_samples,
+    m_iBufferSize1 = av_samples_get_buffer_size(NULL, octx->channels, out_samples, octx->sample_fmt, 0);
+    if ((conv_error =  av_samples_alloc(&output, &out_linesize, octx->channels, out_samples,
                                    octx->sample_fmt, 0)) < 0) {
       tvhlog(LOG_ERR, "transcode", "Could not allocate converted input samples (error '%s')",get_error_text(conv_error));
-      av_freep(&(*converted_input_samples)[0]);
-      free(*converted_input_samples);
 
-      av_freep(&output);
       goto cleanup;
     }
 
-    if ((conv_error = avresample_convert(resample_context, converted_input_samples, 0,
-                                         frame1->nb_samples, frame1->extended_data, 0, frame1->nb_samples)) < 0) {
-      tvhlog(LOG_ERR, "transcode", "Could not do avresample_convert() (error '%s')",get_error_text(conv_error));
-      av_freep(&(*converted_input_samples)[0]);
-      free(*converted_input_samples);
-      av_freep(&output);
+    out_samples = avresample_convert(as->resample_context, &output, out_linesize, out_samples,
+                                        frame1->data, in_linesize, in_samples);
+
+    int fifo_samples = avresample_available(as->resample_context);
+    if (fifo_samples) {
+      tvhlog(LOG_DEBUG, "transcode", "%d samples in resamples fifo buffer.", fifo_samples);
       goto cleanup;
     }
 
-    if (avresample_available(resample_context)) {
-      fprintf(stderr, "Converted samples left over\n");
-      tvhlog(LOG_ERR, "transcode", "Converted samples left over in audio converter.");
-      av_freep(&(*converted_input_samples)[0]);
-      free(*converted_input_samples);
-      av_freep(&output);
+    int delay_samples = avresample_get_delay(as->resample_context);
+    if (delay_samples) {
+      tvhlog(LOG_DEBUG, "transcode", "%d samples in resamples delay buffer.", delay_samples);
       goto cleanup;
     }
-/*    out_samples = av_rescale_rnd(swr_get_delay(swr, octx->sample_rate) + in_samples, octx->sample_rate, octx->sample_rate, AV_ROUND_UP);
-    av_samples_alloc(&output, NULL, octx->channels, out_samples, octx->sample_fmt, 0);
-    out_samples = swr_convert(swr, &output, out_samples, (const uint8_t **)&frame1->data[0], in_samples);
-    if (out_samples < 0) {
-			tvhlog(LOG_ERR, "transcode", "Error swr_convert.\n");
-			av_freep(&output);
-			goto cleanup;
-    }
 
-    m_iBufferSize1 = av_samples_get_buffer_size(NULL, octx->channels, out_samples, octx->sample_fmt, 1);
-    tvhlog(LOG_DEBUG, "transcode", "converted: m_iBufferSize1=%d, out_samples=%d\n", m_iBufferSize1, out_samples);
-*/
     av_init_packet(&packet);
-//    packet.data = output;
-//    packet.size = m_iBufferSize1;
-    packet.data = *converted_input_samples;
-    packet.size = frame1->nb_samples;
+    packet.data = output;
+    packet.size = m_iBufferSize1;
   }
   else {
     tvhlog(LOG_DEBUG, "transcode", "No conversion needed");
     av_init_packet(&packet);
+    m_iBufferSize1 = av_samples_get_buffer_size(NULL, ictx->channels, frame1->nb_samples, ictx->sample_fmt, 0);
+
     packet.data = frame1->data[0];
     packet.size = m_iBufferSize1;
-    //out_samples = frame1->nb_samples;
+    out_samples = frame1->nb_samples;
   }
 
   if ((as->aud_dec_size - as->aud_dec_offset - packet.size) <= 0) {
-    tvhlog(LOG_ERR, "transcode", "Decoder buffer overflow. Decoded en converted audio does not fit in aud_dec_sample memory.");
+    tvhlog(LOG_ERR, "transcode", "Decoder buffer overflow. Decoded and converted audio does not fit in aud_dec_sample memory.");
     ts->ts_index = 0;
     goto cleanup;
   }
@@ -785,6 +784,7 @@ transcoder_stream_audio(transcoder_stream_t *ts, th_pkt_t *pkt)
 
   len = as->aud_dec_offset;
      tvhlog(LOG_DEBUG, "transcode", "converted: len=%d, frame_bytes=%d", len, frame_bytes);
+     tvhlog(LOG_DEBUG, "transcode", "converted: octx->frame_size=%d, out_samples=%d", octx->frame_size, out_samples);
 
   for (i = 0; i <= (len - frame_bytes); i += frame_bytes) {
      tvhlog(LOG_DEBUG, "transcode", "converted: i=%d, (len - frame_bytes)=%d", i, (len - frame_bytes));
@@ -808,19 +808,16 @@ transcoder_stream_audio(transcoder_stream_t *ts, th_pkt_t *pkt)
                                    &packet,
                                    frame1,
                                    &got_packet_ptr);
-/*    length = avcodec_encode_audio(octx,
-				  as->aud_enc_sample,
-				  as->aud_enc_size,
-				  (short *)(as->aud_dec_sample + i));
-*/
+     tvhlog(LOG_DEBUG, "transcode", "encoded: packet.size=%d, ret=%d, got_packet_ptr=%d", packet.size, ret, got_packet_ptr);
     if ((ret < 0) || (got_packet_ptr < -1)) {
       tvhlog(LOG_ERR, "transcode", "Unable to encode audio (%d:%d)(i=%d)", ret, got_packet_ptr, i);
       ts->ts_index = 0;
       goto cleanup;
 
-    } else if (ret) {
+    } else if (got_packet_ptr) {
       //
       length = packet.size;
+     tvhlog(LOG_DEBUG, "transcode", "encoded: packet.pts=%" PRIu64 ", packet.dts=%" PRIu64 ", as->aud_enc_pts=%lu", packet.pts, packet.dts, as->aud_enc_pts);
       n = pkt_alloc(packet.data, packet.size, as->aud_enc_pts, as->aud_enc_pts);
       //n = pkt_alloc(as->aud_enc_sample, length, as->aud_enc_pts, as->aud_enc_pts);
       n->pkt_componentindex = ts->ts_index;
@@ -852,6 +849,10 @@ transcoder_stream_audio(transcoder_stream_t *ts, th_pkt_t *pkt)
 	    as->aud_dec_offset);
 
  cleanup:
+  if (converted_input_samples != NULL) {
+    av_freep(&(*converted_input_samples)[0]);
+    free(*converted_input_samples);
+  }
   av_frame_free(&frame1);
   av_free_packet(&packet);
   pkt_ref_dec(pkt);
