@@ -717,20 +717,28 @@ transcoder_stream_audio(transcoder_stream_t *ts, th_pkt_t *pkt)
     frame2->format = octx->sample_fmt;
 
     frame1->sample_rate = ictx->sample_rate;
-    tvhlog(LOG_DEBUG, "transcode", "frame1->channel_layout:%" PRIu64, frame1->channel_layout);
-    tvhlog(LOG_DEBUG, "transcode", "frame1->sample_rate:%d", frame1->sample_rate);
-    tvhlog(LOG_DEBUG, "transcode", "frame1->format:%d", frame1->format);
-    tvhlog(LOG_DEBUG, "transcode", "frame2->channel_layout:%" PRIu64, frame2->channel_layout);
-    tvhlog(LOG_DEBUG, "transcode", "frame2->sample_rate:%d", frame2->sample_rate);
-    tvhlog(LOG_DEBUG, "transcode", "frame2->format:%d", frame2->format);
+    tvhlog(LOG_DEBUG, "transcode", "before: frame1->channel_layout:%" PRIu64, frame1->channel_layout);
+    tvhlog(LOG_DEBUG, "transcode", "        frame1->sample_rate:%d", frame1->sample_rate);
+    tvhlog(LOG_DEBUG, "transcode", "        frame1->format:%d", frame1->format);
+    tvhlog(LOG_DEBUG, "transcode", "        frame1->nb_samples:%d", frame1->nb_samples);
+    tvhlog(LOG_DEBUG, "transcode", "        frame2->channel_layout:%" PRIu64, frame2->channel_layout);
+    tvhlog(LOG_DEBUG, "transcode", "        frame2->sample_rate:%d", frame2->sample_rate);
+    tvhlog(LOG_DEBUG, "transcode", "        frame2->format:%d", frame2->format);
+    tvhlog(LOG_DEBUG, "transcode", "        frame2->nb_samples:%d", frame2->nb_samples);
 
     int convert_error = avresample_convert_frame(as->resample_context, frame2, frame1);
     if (convert_error != 0) {
       tvhlog(LOG_DEBUG, "transcode", "Error could not resample audio frame avresample_convert_frame() (Error:%s).", get_error_text(convert_error));
       goto cleanup;
     }
-    tvhlog(LOG_DEBUG, "transcode", "frame1->nb_samples:%d", frame1->nb_samples);
-    tvhlog(LOG_DEBUG, "transcode", "frame1->nb_samples:%d", frame2->nb_samples);
+    tvhlog(LOG_DEBUG, "transcode", "after:  frame1->channel_layout:%" PRIu64, frame1->channel_layout);
+    tvhlog(LOG_DEBUG, "transcode", "        frame1->sample_rate:%d", frame1->sample_rate);
+    tvhlog(LOG_DEBUG, "transcode", "        frame1->format:%d", frame1->format);
+    tvhlog(LOG_DEBUG, "transcode", "        frame1->nb_samples:%d", frame1->nb_samples);
+    tvhlog(LOG_DEBUG, "transcode", "        frame2->channel_layout:%" PRIu64, frame2->channel_layout);
+    tvhlog(LOG_DEBUG, "transcode", "        frame2->sample_rate:%d", frame2->sample_rate);
+    tvhlog(LOG_DEBUG, "transcode", "        frame2->format:%d", frame2->format);
+    tvhlog(LOG_DEBUG, "transcode", "        frame2->nb_samples:%d", frame2->nb_samples);
 
     int fifo_samples = avresample_available(as->resample_context);
     if (fifo_samples) {
@@ -1061,7 +1069,7 @@ transcoder_stream_video(transcoder_stream_t *ts, th_pkt_t *pkt)
     }
 
     if (got_output) {
-      tvhlog(LOG_DEBUG, "transcode", "encoding frame %3d (size=%5d)\n", frame_count, packet2.size);
+      tvhlog(LOG_DEBUG, "transcode", "encoding frame %3d (size=%5d)", frame_count, packet2.size);
 
       out = av_realloc(&out, length + packet2.size + FF_INPUT_BUFFER_PADDING_SIZE);
       memset(out + length, 0, packet2.size);
