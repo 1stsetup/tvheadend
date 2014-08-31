@@ -479,17 +479,14 @@ transcoder_stream_audio(transcoder_stream_t *ts, th_pkt_t *pkt)
   AVCodec *icodec, *ocodec;
   AVCodecContext *ictx, *octx;
   AVPacket packet;
-  int length, len, i;
-  uint32_t frame_bytes;
-  short *samples;
+  int length, len;
   streaming_message_t *sm;
   th_pkt_t *n;
   audio_stream_t *as = (audio_stream_t*)ts;
   int got_frame, got_packet_ptr;
   AVFrame *frame1 = av_frame_alloc();
-  int m_iBufferSize1;
-  uint8_t **converted_input_samples = NULL;
-  uint8_t *output;
+  AVFrame *frame2 = av_frame_alloc();
+  int resample = 0;
 
   ictx = as->aud_ictx;
   octx = as->aud_octx;
@@ -650,7 +647,7 @@ transcoder_stream_audio(transcoder_stream_t *ts, th_pkt_t *pkt)
     break;
   }
 
-  int resample = ((ictx->channels != octx->channels) ||
+  resample = ((ictx->channels != octx->channels) ||
       (ictx->channel_layout != octx->channel_layout) ||
       (ictx->sample_fmt != octx->sample_fmt) ||
       (ictx->sample_rate != octx->sample_rate));
@@ -713,27 +710,27 @@ transcoder_stream_audio(transcoder_stream_t *ts, th_pkt_t *pkt)
     }
   }
 
-  int out_samples;
-
   if (resample) {
 
-    int in_samples = frame1->nb_samples;
-    tvhlog(LOG_DEBUG, "transcode", "converted: in_samples=%d", in_samples);
+    frame2->channel_layout = av_get_default_channel_layout(octx->channels);
+    frame2->sample_rate = octx->sample_rate;
+    frame2->format = octx->sample_fmt;
 
-    int in_linesize = 0;
-    int out_linesize;
-    out_samples = avresample_get_out_samples(as->resample_context, in_samples);
-    int conv_error;
-    m_iBufferSize1 = av_samples_get_buffer_size(NULL, octx->channels, out_samples, octx->sample_fmt, 0);
-    if ((conv_error =  av_samples_alloc(&output, &out_linesize, octx->channels, out_samples,
-                                   octx->sample_fmt, 0)) < 0) {
-      tvhlog(LOG_ERR, "transcode", "Could not allocate converted input samples (error '%s')",get_error_text(conv_error));
+    frame1->sample_rate = ictx->sample_rate;
+    tvhlog(LOG_DEBUG, "transcode", "frame1->channel_layout:%" PRIu64, frame1->channel_layout);
+    tvhlog(LOG_DEBUG, "transcode", "frame1->sample_rate:%d", frame1->sample_rate);
+    tvhlog(LOG_DEBUG, "transcode", "frame1->format:%d", frame1->format);
+    tvhlog(LOG_DEBUG, "transcode", "frame2->channel_layout:%" PRIu64, frame2->channel_layout);
+    tvhlog(LOG_DEBUG, "transcode", "frame2->sample_rate:%d", frame2->sample_rate);
+    tvhlog(LOG_DEBUG, "transcode", "frame2->format:%d", frame2->format);
 
+    int convert_error = avresample_convert_frame(as->resample_context, frame2, frame1);
+    if (convert_error != 0) {
+      tvhlog(LOG_DEBUG, "transcode", "Error could not resample audio frame avresample_convert_frame() (Error:%s).", get_error_text(convert_error));
       goto cleanup;
     }
-
-    out_samples = avresample_convert(as->resample_context, &output, out_linesize, out_samples,
-                                        frame1->data, in_linesize, in_samples);
+    tvhlog(LOG_DEBUG, "transcode", "frame1->nb_samples:%d", frame1->nb_samples);
+    tvhlog(LOG_DEBUG, "transcode", "frame1->nb_samples:%d", frame2->nb_samples);
 
     int fifo_samples = avresample_available(as->resample_context);
     if (fifo_samples) {
@@ -747,113 +744,58 @@ transcoder_stream_audio(transcoder_stream_t *ts, th_pkt_t *pkt)
       goto cleanup;
     }
 
-    av_init_packet(&packet);
-    packet.data = output;
-    packet.size = m_iBufferSize1;
-  }
-  else {
-    tvhlog(LOG_DEBUG, "transcode", "No conversion needed");
-    av_init_packet(&packet);
-    m_iBufferSize1 = av_samples_get_buffer_size(NULL, ictx->channels, frame1->nb_samples, ictx->sample_fmt, 0);
-
-    packet.data = frame1->data[0];
-    packet.size = m_iBufferSize1;
-    out_samples = frame1->nb_samples;
   }
 
-  if ((as->aud_dec_size - as->aud_dec_offset - packet.size) <= 0) {
-    tvhlog(LOG_ERR, "transcode", "Decoder buffer overflow. Decoded and converted audio does not fit in aud_dec_sample memory.");
-    ts->ts_index = 0;
-    goto cleanup;
-  }
-
-  // Write to buffer
-  samples = (short*)(as->aud_dec_sample + as->aud_dec_offset);
-  memcpy(samples, packet.data, packet.size);
-  as->aud_dec_offset =+ packet.size;
   as->aud_dec_pts    += pkt->pkt_duration;
   av_free_packet(&packet);
 
-  frame_bytes = av_get_bytes_per_sample(octx->sample_fmt) *
-    octx->frame_size *
-    octx->channels;
-/*
-  frame_bytes = av_samples_get_buffer_size(NULL, octx->channels, octx->frame_size,
-                                               octx->sample_fmt, 0);
-*/
-
-  len = as->aud_dec_offset;
-     tvhlog(LOG_DEBUG, "transcode", "converted: len=%d, frame_bytes=%d", len, frame_bytes);
-     tvhlog(LOG_DEBUG, "transcode", "converted: octx->frame_size=%d, out_samples=%d", octx->frame_size, out_samples);
-
-  for (i = 0; i <= (len - frame_bytes); i += frame_bytes) {
-     tvhlog(LOG_DEBUG, "transcode", "converted: i=%d, (len - frame_bytes)=%d", i, (len - frame_bytes));
-    av_frame_free(&frame1);
-    frame1 = av_frame_alloc();
-    frame1->nb_samples = octx->frame_size;
-//    frame1->nb_samples = out_samples;
-    frame1->format = octx->sample_fmt;
-    frame1->channel_layout = octx->channel_layout;
-
-    int ret = avcodec_fill_audio_frame(frame1, octx->channels, octx->sample_fmt, (const uint8_t*)(as->aud_dec_sample + i), frame_bytes, 0);
-    if (ret < 0) {
-      tvhlog(LOG_ERR, "transcode", "Failed avcodec_fill_audio_frame().");
-      ts->ts_index = 0;
-      goto cleanup;
-    }
-
-    packet.data = NULL; // packet data will be allocated by the encoder
-    packet.size = 0;
-    ret = avcodec_encode_audio2(octx,
+  packet.data = NULL; // packet data will be allocated by the encoder
+  packet.size = 0;
+  int ret = avcodec_encode_audio2(octx,
                                    &packet,
-                                   frame1,
+                                   //resample ? frame2 : frame1,
+                                   frame2,
                                    &got_packet_ptr);
-     tvhlog(LOG_DEBUG, "transcode", "encoded: packet.size=%d, ret=%d, got_packet_ptr=%d", packet.size, ret, got_packet_ptr);
-    if ((ret < 0) || (got_packet_ptr < -1)) {
-      tvhlog(LOG_ERR, "transcode", "Unable to encode audio (%d:%d)(i=%d)", ret, got_packet_ptr, i);
-      ts->ts_index = 0;
-      goto cleanup;
+  tvhlog(LOG_DEBUG, "transcode", "encoded: packet.size=%d, ret=%d, got_packet_ptr=%d", packet.size, ret, got_packet_ptr);
+  tvhlog(LOG_ERR, "transcode", "ret=%s",get_error_text(ret));
+  if ((ret < 0) || (got_packet_ptr < -1)) {
+    tvhlog(LOG_ERR, "transcode", "Unable to encode audio (%d:%d)", ret, got_packet_ptr);
+    ts->ts_index = 0;
+    goto cleanup;
 
-    } else if (got_packet_ptr) {
+  } else if (got_packet_ptr) {
       //
-      length = packet.size;
-     tvhlog(LOG_DEBUG, "transcode", "encoded: packet.pts=%" PRIu64 ", packet.dts=%" PRIu64 ", as->aud_enc_pts=%lu", packet.pts, packet.dts, as->aud_enc_pts);
-      n = pkt_alloc(packet.data, packet.size, as->aud_enc_pts, as->aud_enc_pts);
+    length = packet.size;
+    tvhlog(LOG_DEBUG, "transcode", "encoded: packet.pts=%" PRIu64 ", packet.dts=%" PRIu64 ", as->aud_enc_pts=%lu", packet.pts, packet.dts, as->aud_enc_pts);
+    n = pkt_alloc(packet.data, packet.size, as->aud_enc_pts, as->aud_enc_pts);
       //n = pkt_alloc(as->aud_enc_sample, length, as->aud_enc_pts, as->aud_enc_pts);
-      n->pkt_componentindex = ts->ts_index;
-      n->pkt_frametype      = pkt->pkt_frametype;
-      n->pkt_channels       = octx->channels;
-      n->pkt_sri            = pkt->pkt_sri;
+    n->pkt_componentindex = ts->ts_index;
+    n->pkt_frametype      = pkt->pkt_frametype;
+    n->pkt_channels       = octx->channels;
+    n->pkt_sri            = pkt->pkt_sri;
 
-      if (octx->coded_frame && octx->coded_frame->pts != AV_NOPTS_VALUE)
-	n->pkt_duration = octx->coded_frame->pts - as->aud_enc_pts;
-      else
-	n->pkt_duration = frame_bytes*90000 / (2 * octx->channels * octx->sample_rate);
+    if (octx->coded_frame && octx->coded_frame->pts != AV_NOPTS_VALUE)
+      n->pkt_duration = octx->coded_frame->pts - as->aud_enc_pts;
+    else
+      n->pkt_duration = (av_get_bytes_per_sample(octx->sample_fmt) *
+                            octx->frame_size *
+                            octx->channels)*90000 / (2 * octx->channels * octx->sample_rate);
 
-      as->aud_enc_pts += n->pkt_duration;
+    as->aud_enc_pts += n->pkt_duration;
 
-      if (octx->extradata_size)
-	n->pkt_header = pktbuf_alloc(octx->extradata, octx->extradata_size);
+    if (octx->extradata_size)
+      n->pkt_header = pktbuf_alloc(octx->extradata, octx->extradata_size);
 
-      sm = streaming_msg_create_pkt(n);
-      streaming_target_deliver2(ts->ts_target, sm);
-      pkt_ref_dec(n);
-    }
+    sm = streaming_msg_create_pkt(n);
+    streaming_target_deliver2(ts->ts_target, sm);
+    pkt_ref_dec(n);
+  }
 
     av_free_packet(&packet);
-    as->aud_dec_offset -= frame_bytes;
-  }
-
-  if (as->aud_dec_offset)
-    memmove(as->aud_dec_sample, as->aud_dec_sample + len - as->aud_dec_offset,
-	    as->aud_dec_offset);
 
  cleanup:
-  if (converted_input_samples != NULL) {
-    av_freep(&(*converted_input_samples)[0]);
-    free(*converted_input_samples);
-  }
   av_frame_free(&frame1);
+  av_frame_free(&frame2);
   av_free_packet(&packet);
   pkt_ref_dec(pkt);
 }
