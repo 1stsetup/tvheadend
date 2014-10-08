@@ -425,6 +425,147 @@ http_stream_run(http_connection_t *hc, streaming_queue_t *sq,
 
 
 /**
+ * HTTP stream dvrfile loop
+ */
+static void
+http_stream_dvrfile_run(http_connection_t *hc, streaming_queue_t *sq,
+		const char *name, muxer_container_type_t mc,
+                int fd, streaming_target_t *st, muxer_config_t *mcfg)
+{
+  streaming_message_t *sm;
+  int run = 1;
+  int started = 0;
+  muxer_t *mux = NULL;
+  int timeouts = 0, grace = 20;
+  struct timespec ts;
+  struct timeval  tp;
+  int err = 0;
+  socklen_t errlen = sizeof(err);
+
+  mux = muxer_create(mc, mcfg);
+  if(muxer_open_stream(mux, hc->hc_fd))
+    run = 0;
+
+  /* reduce timeout on write() for streaming */
+  tp.tv_sec  = 5;
+  tp.tv_usec = 0;
+  setsockopt(hc->hc_fd, SOL_SOCKET, SO_SNDTIMEO, &tp, sizeof(tp));
+
+  while(run && tvheadend_running) {
+    pthread_mutex_lock(&sq->sq_mutex);
+    sm = TAILQ_FIRST(&sq->sq_queue);
+    if(sm == NULL) {      
+      gettimeofday(&tp, NULL);
+      ts.tv_sec  = tp.tv_sec + 1;
+      ts.tv_nsec = tp.tv_usec * 1000;
+
+      if(pthread_cond_timedwait(&sq->sq_cond, &sq->sq_mutex, &ts) == ETIMEDOUT) {
+          timeouts++;
+
+          //Check socket status
+          getsockopt(hc->hc_fd, SOL_SOCKET, SO_ERROR, (char *)&err, &errlen);  
+          if (err) {
+              tvhlog(LOG_DEBUG, "webui",  "Stop streaming %s, client hung up", hc->hc_url_orig);
+              run = 0;
+          } else if(timeouts >= grace) {
+              tvhlog(LOG_WARNING, "webui",  "Stop streaming %s, timeout waiting for packets", hc->hc_url_orig);
+              run = 0;
+          }
+      }
+      pthread_mutex_unlock(&sq->sq_mutex);
+
+      // Read from input.
+      continue;
+    }
+
+    timeouts = 0; //Reset timeout counter
+    TAILQ_REMOVE(&sq->sq_queue, sm, sm_link);
+    pthread_mutex_unlock(&sq->sq_mutex);
+
+    switch(sm->sm_type) {
+    case SMT_MPEGTS:
+    case SMT_PACKET:
+      if(started) {
+  /*      pktbuf_t *pb;
+        if (sm->sm_type == SMT_PACKET)
+          pb = ((th_pkt_t*)sm->sm_data)->pkt_payload;
+        else
+          pb = sm->sm_data;
+  */      muxer_write_pkt(mux, sm->sm_type, sm->sm_data);
+        sm->sm_data = NULL;
+      }
+      break;
+
+    case SMT_GRACE:
+      grace = sm->sm_code < 5 ? 5 : grace;
+      break;
+
+    case SMT_START:
+      grace = 10;
+      if(!started) {
+        tvhlog(LOG_DEBUG, "webui",  "Start streaming %s", hc->hc_url_orig);
+        http_output_content(hc, muxer_mime(mux, sm->sm_data));
+
+        if(muxer_init(mux, sm->sm_data, name) < 0)
+          run = 0;
+
+        started = 1;
+      } else if(muxer_reconfigure(mux, sm->sm_data) < 0) {
+        tvhlog(LOG_WARNING, "webui",  "Unable to reconfigure stream %s", hc->hc_url_orig);
+      }
+      break;
+
+    case SMT_STOP:
+      if(sm->sm_code != SM_CODE_SOURCE_RECONFIGURED) {
+        tvhlog(LOG_WARNING, "webui",  "Stop streaming %s, %s", hc->hc_url_orig, 
+               streaming_code2txt(sm->sm_code));
+        run = 0;
+      }
+      break;
+
+    case SMT_SERVICE_STATUS:
+      if(getsockopt(hc->hc_fd, SOL_SOCKET, SO_ERROR, &err, &errlen)) {
+        tvhlog(LOG_DEBUG, "webui",  "Stop streaming %s, client hung up",
+               hc->hc_url_orig);
+        run = 0;
+      }
+      break;
+
+    case SMT_SKIP:
+    case SMT_SPEED:
+    case SMT_SIGNAL_STATUS:
+    case SMT_TIMESHIFT_STATUS:
+      break;
+
+    case SMT_NOSTART:
+      tvhlog(LOG_WARNING, "webui",  "Couldn't start streaming %s, %s",
+             hc->hc_url_orig, streaming_code2txt(sm->sm_code));
+      run = 0;
+      break;
+
+    case SMT_EXIT:
+      tvhlog(LOG_WARNING, "webui",  "Stop streaming %s, %s", hc->hc_url_orig,
+             streaming_code2txt(sm->sm_code));
+      run = 0;
+      break;
+    }
+
+    streaming_msg_free(sm);
+
+    if(mux->m_errors) {
+      if (!mux->m_eos)
+        tvhlog(LOG_WARNING, "webui",  "Stop streaming %s, muxer reported errors", hc->hc_url_orig);
+      run = 0;
+    }
+  }
+
+  if(started)
+    muxer_close(mux);
+
+  muxer_destroy(mux);
+}
+
+/**
  * Output a playlist containing a single channel
  */
 static int
@@ -1015,174 +1156,109 @@ http_stream_channel(http_connection_t *hc, channel_t *ch, int weight)
 
 
 /**
- * Handle the http request. http://tvheadend/stream/channelid/<chid>
- *                          http://tvheadend/stream/channel/<chname>
- *                          http://tvheadend/stream/service/<servicename>
- *                          http://tvheadend/stream/mux/<muxid>
+ * Open dvr file and stream.
  */
 static int
-http_stream(http_connection_t *hc, const char *remain, void *opaque)
+http_stream_dvrfile(http_connection_t *hc, dvr_entry_t *de, int weight)
 {
-  char *components[2];
-  channel_t *ch = NULL;
-  service_t *service = NULL;
-#if ENABLE_MPEGTS
-  mpegts_mux_t *mm = NULL;
+  const char *content = NULL;//, *range;
+  char *fname;
+
+  streaming_queue_t sq;
+  streaming_target_t *gh;
+  streaming_target_t *tsfix;
+  streaming_target_t *st;
+#if ENABLE_LIBAV
+  streaming_target_t *tr = NULL;
 #endif
-  const char *str;
-  int weight = 0;
+  dvr_config_t *cfg;
+  int flags = SUBSCRIPTION_STREAMING;
+  muxer_container_type_t mc;
+  char *str;
+  size_t qsize;
+  const char *name;
+  //char addrbuf[50];
+  void *tcp_id;
+  int res = 0;
+  struct stat fdstat;
+  int fd;
 
-  hc->hc_keep_alive = 0;
+  fname = strdup(de->de_filename);
+  content = muxer_container_type2mime(de->de_mc, 1);
+  tvhlog(LOG_ERR, "webui", "http_stream_dvrfile: fname:%s, content:%s", fname, content);
 
-  if(remain == NULL) {
-    http_error(hc, HTTP_STATUS_BAD_REQUEST);
-    return HTTP_STATUS_BAD_REQUEST;
+  if((tcp_id = http_stream_preop(hc)) == NULL)
+    return HTTP_STATUS_NOT_ALLOWED;
+
+  cfg = dvr_config_find_by_name_default(NULL);
+
+  /* Build muxer config - this takes the defaults from the default dvr config, which is a hack */
+  mc = muxer_container_txt2type(http_arg_get(&hc->hc_req_args, "mux"));
+  if(mc == MC_UNKNOWN) {
+    mc = cfg->dvr_mc;
   }
 
-  if(http_tokenize((char *)remain, components, 2, '/') != 2) {
-    http_error(hc, HTTP_STATUS_BAD_REQUEST);
-    return HTTP_STATUS_BAD_REQUEST;
-  }
+  if ((str = http_arg_get(&hc->hc_req_args, "qsize")))
+    qsize = atoll(str);
+  else
+    qsize = 1500000;
 
-  http_deescape(components[1]);
-
-  if ((str = http_arg_get(&hc->hc_req_args, "weight")))
-    weight = atoi(str);
-
-  scopedgloballock();
-
-  if(!strcmp(components[0], "channelid")) {
-    ch = channel_find_by_id(atoi(components[1]));
-  } else if(!strcmp(components[0], "channelnumber")) {
-    ch = channel_find_by_number(components[1]);
-  } else if(!strcmp(components[0], "channelname")) {
-    ch = channel_find_by_name(components[1]);
-  } else if(!strcmp(components[0], "channel")) {
-    ch = channel_find(components[1]);
-  } else if(!strcmp(components[0], "service")) {
-    service = service_find_by_identifier(components[1]);
-#if ENABLE_MPEGTS
-  } else if(!strcmp(components[0], "mux")) {
-    // TODO: do we want to be able to force starting a particular instance
-    mm      = mpegts_mux_find(components[1]);
-#endif
-  }
-
-  if(ch != NULL) {
-    return http_stream_channel(hc, ch, weight);
-  } else if(service != NULL) {
-    return http_stream_service(hc, service, weight);
-#if ENABLE_MPEGTS
-  } else if(mm != NULL) {
-    return http_stream_mux(hc, mm, weight);
-#endif
+  if(mc == MC_PASS || mc == MC_RAW) {
+    streaming_queue_init2(&sq, SMT_PACKET, qsize);
+    gh = NULL;
+    tsfix = NULL;
+    st = &sq.sq_st;
+    flags |= SUBSCRIPTION_RAW_MPEGTS;
   } else {
-    http_error(hc, HTTP_STATUS_BAD_REQUEST);
-    return HTTP_STATUS_BAD_REQUEST;
+    streaming_queue_init2(&sq, 0, qsize);
+    gh = globalheaders_create(&sq.sq_st);
+#if ENABLE_LIBAV
+    transcoder_props_t props;
+    if(http_get_transcoder_properties(&hc->hc_req_args, &props)) {
+      tr = transcoder_create(gh);
+      transcoder_set_properties(tr, &props);
+      tsfix = tsfix_create(tr);
+    } else
+#endif
+    tsfix = tsfix_create(gh);
+    st = tsfix;
   }
-}
 
-/**
- * Generate a xspf playlist
- * http://en.wikipedia.org/wiki/XML_Shareable_Playlist_Format
- */
-static int
-page_xspf(http_connection_t *hc, const char *remain, void *opaque)
-{
-  size_t maxlen;
-  char *buf;
-  const char *host = http_arg_get(&hc->hc_args, "Host");
-  const char *title;
-  size_t len;
+  fd = tvh_open(fname, O_RDONLY, 0);
+  free(fname);
 
-  if ((title = http_arg_get(&hc->hc_req_args, "title")) == NULL)
-    title = "TVHeadend Stream";
-
-  maxlen = strlen(remain) + strlen(title) + 256;
-  buf = alloca(maxlen);
-
-  snprintf(buf, maxlen, "\
-<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n\
-<playlist version=\"1\" xmlns=\"http://xspf.org/ns/0/\">\r\n\
-  <trackList>\r\n\
-     <track>\r\n\
-       <title>%s</title>\r\n\
-       <location>http://%s/%s</location>\r\n\
-     </track>\r\n\
-  </trackList>\r\n\
-</playlist>\r\n", title, host, remain);
-
-  len = strlen(buf);
-  http_send_header(hc, 200, "application/xspf+xml", len, 0, NULL, 10, 0, NULL);
-  tvh_write(hc->hc_fd, buf, len);
-
-  return 0;
-}
-
-/**
- * Generate an M3U playlist
- * http://en.wikipedia.org/wiki/M3U
- */
-static int
-page_m3u(http_connection_t *hc, const char *remain, void *opaque)
-{
-  size_t maxlen;
-  char *buf;
-  const char *host = http_arg_get(&hc->hc_args, "Host");
-  const char *title;
-  size_t len;
-
-  if ((title = http_arg_get(&hc->hc_req_args, "title")) == NULL)
-    title = "TVHeadend Stream";
-
-  maxlen = strlen(remain) + strlen(title) + 256;
-  buf = alloca(maxlen);
-
-  snprintf(buf, maxlen, "\
-#EXTM3U\r\n\
-#EXTINF:-1,%s\r\n\
-http://%s/%s\r\n", title, host, remain);
-
-  len = strlen(buf);
-  http_send_header(hc, 200, "audio/x-mpegurl", len, 0, NULL, 10, 0, NULL);
-  tvh_write(hc->hc_fd, buf, len);
-
-  return 0;
-}
-
-static char *
-page_play_path_modify(http_connection_t *hc, const char *path, int *cut)
-{
-  /*
-   * For curl, wget and TVHeadend do not send the playlist, stream directly
-   */
-  const char *agent = http_arg_get(&hc->hc_args, "User-Agent");
-  if (strncasecmp(agent, "curl/", 5) == 0 ||
-      strncasecmp(agent, "wget/", 5) == 0)
-    return strdup(path + 5);
-  if (strncasecmp(agent, "TVHeadend/", 10) == 0)
-    return strdup(path + 10);
-  return NULL;
-}
-
-static int
-page_play(http_connection_t *hc, const char *remain, void *opaque)
-{
-  char *playlist;
-
-  if(remain == NULL)
-    return 404;
-
-  playlist = http_arg_get(&hc->hc_req_args, "playlist");
-  if (playlist) {
-    if (strcmp(playlist, "xspf") == 0)
-      return page_xspf(hc, remain, opaque);
-    if (strcmp(playlist, "m3u") == 0)
-      return page_m3u(hc, remain, opaque);
+  if ((fd >= 0) && (fstat(fd, &fdstat) < 0)) {
+    close(fd);
+    fd = -1;
+    res = 404;
   }
-  if (webui_xspf)
-    return page_xspf(hc, remain, opaque);
-  return page_m3u(hc, remain, opaque);
+
+  if(fd >= 0) {
+    name = tvh_strdupa(de->de_channel_name);
+    pthread_mutex_unlock(&global_lock);
+    http_stream_dvrfile_run(hc, &sq, name, mc, fd, st, &cfg->dvr_muxcnf);
+    pthread_mutex_lock(&global_lock);
+    close(fd);
+  } else {
+    res = HTTP_STATUS_BAD_REQUEST;
+  }
+
+  if(gh)
+    globalheaders_destroy(gh);
+
+#if ENABLE_LIBAV
+  if(tr)
+    transcoder_destroy(tr);
+#endif
+
+  if(tsfix)
+    tsfix_destroy(tsfix);
+
+  streaming_queue_deinit(&sq);
+
+  http_stream_postop(tcp_id);
+
+  return res;
 }
 
 /**
@@ -1304,6 +1380,191 @@ page_dvrfile(http_connection_t *hc, const char *remain, void *opaque)
   }
   close(fd);
   return 0;
+}
+
+/**
+ * Handle the http request. http://tvheadend/stream/channelid/<chid>
+ *                          http://tvheadend/stream/channel/<chname>
+ *                          http://tvheadend/stream/service/<servicename>
+ *                          http://tvheadend/stream/mux/<muxid>
+ *                          http://tvheadend/stream/dvrfile/<uuid>
+ *                          http://tvheadend/stream/dvrfile/<id>
+ */
+static int
+http_stream(http_connection_t *hc, const char *remain, void *opaque)
+{
+  char *components[2];
+  channel_t *ch = NULL;
+  service_t *service = NULL;
+#if ENABLE_MPEGTS
+  mpegts_mux_t *mm = NULL;
+#endif
+  dvr_entry_t *de = NULL;
+
+  const char *str;
+  int weight = 0;
+
+  hc->hc_keep_alive = 0;
+
+  if(remain == NULL) {
+    http_error(hc, HTTP_STATUS_BAD_REQUEST);
+    return HTTP_STATUS_BAD_REQUEST;
+  }
+
+  if(http_tokenize((char *)remain, components, 2, '/') != 2) {
+    http_error(hc, HTTP_STATUS_BAD_REQUEST);
+    return HTTP_STATUS_BAD_REQUEST;
+  }
+
+  http_deescape(components[1]);
+
+  if ((str = http_arg_get(&hc->hc_req_args, "weight")))
+    weight = atoi(str);
+
+  scopedgloballock();
+
+  if(!strcmp(components[0], "channelid")) {
+    ch = channel_find_by_id(atoi(components[1]));
+  } else if(!strcmp(components[0], "channelnumber")) {
+    ch = channel_find_by_number(components[1]);
+  } else if(!strcmp(components[0], "channelname")) {
+    ch = channel_find_by_name(components[1]);
+  } else if(!strcmp(components[0], "channel")) {
+    ch = channel_find(components[1]);
+  } else if(!strcmp(components[0], "service")) {
+    service = service_find_by_identifier(components[1]);
+#if ENABLE_MPEGTS
+  } else if(!strcmp(components[0], "mux")) {
+    // TODO: do we want to be able to force starting a particular instance
+    mm      = mpegts_mux_find(components[1]);
+#endif
+  } else if(!strcmp(components[0], "dvrfile")) {
+    de = dvr_entry_find_by_uuid(components[1]);
+    if (de == NULL)
+      de = dvr_entry_find_by_id(atoi(components[1]));
+  }
+
+  if(ch != NULL) {
+    return http_stream_channel(hc, ch, weight);
+  } else if(service != NULL) {
+    return http_stream_service(hc, service, weight);
+#if ENABLE_MPEGTS
+  } else if(mm != NULL) {
+    return http_stream_mux(hc, mm, weight);
+#endif
+  } else if(de != NULL) {
+#if ENABLE_LIBAV
+      return http_stream_dvrfile(hc, de, weight);
+#else
+      return page_dvrfile(hc, remain, opaque);
+#endif
+  } else {
+    http_error(hc, HTTP_STATUS_BAD_REQUEST);
+    return HTTP_STATUS_BAD_REQUEST;
+  }
+}
+
+/**
+ * Generate a xspf playlist
+ * http://en.wikipedia.org/wiki/XML_Shareable_Playlist_Format
+ */
+static int
+page_xspf(http_connection_t *hc, const char *remain, void *opaque)
+{
+  size_t maxlen;
+  char *buf;
+  const char *host = http_arg_get(&hc->hc_args, "Host");
+  const char *title;
+  size_t len;
+
+  if ((title = http_arg_get(&hc->hc_req_args, "title")) == NULL)
+    title = "TVHeadend Stream";
+
+  maxlen = strlen(remain) + strlen(title) + 256;
+  buf = alloca(maxlen);
+
+  snprintf(buf, maxlen, "\
+<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n\
+<playlist version=\"1\" xmlns=\"http://xspf.org/ns/0/\">\r\n\
+  <trackList>\r\n\
+     <track>\r\n\
+       <title>%s</title>\r\n\
+       <location>http://%s/%s</location>\r\n\
+     </track>\r\n\
+  </trackList>\r\n\
+</playlist>\r\n", title, host, remain);
+
+  len = strlen(buf);
+  http_send_header(hc, 200, "application/xspf+xml", len, 0, NULL, 10, 0, NULL);
+  tvh_write(hc->hc_fd, buf, len);
+
+  return 0;
+}
+
+/**
+ * Generate an M3U playlist
+ * http://en.wikipedia.org/wiki/M3U
+ */
+static int
+page_m3u(http_connection_t *hc, const char *remain, void *opaque)
+{
+  size_t maxlen;
+  char *buf;
+  const char *host = http_arg_get(&hc->hc_args, "Host");
+  const char *title;
+  size_t len;
+
+  if ((title = http_arg_get(&hc->hc_req_args, "title")) == NULL)
+    title = "TVHeadend Stream";
+
+  maxlen = strlen(remain) + strlen(title) + 256;
+  buf = alloca(maxlen);
+
+  snprintf(buf, maxlen, "\
+#EXTM3U\r\n\
+#EXTINF:-1,%s\r\n\
+http://%s/%s\r\n", title, host, remain);
+
+  len = strlen(buf);
+  http_send_header(hc, 200, "audio/x-mpegurl", len, 0, NULL, 10, 0, NULL);
+  tvh_write(hc->hc_fd, buf, len);
+
+  return 0;
+}
+
+static char *
+page_play_path_modify(http_connection_t *hc, const char *path, int *cut)
+{
+  /*
+   * For curl, wget and TVHeadend do not send the playlist, stream directly
+   */
+  const char *agent = http_arg_get(&hc->hc_args, "User-Agent");
+  if (strncasecmp(agent, "curl/", 5) == 0 ||
+      strncasecmp(agent, "wget/", 5) == 0)
+    return strdup(path + 5);
+  if (strncasecmp(agent, "TVHeadend/", 10) == 0)
+    return strdup(path + 10);
+  return NULL;
+}
+
+static int
+page_play(http_connection_t *hc, const char *remain, void *opaque)
+{
+  char *playlist;
+
+  if(remain == NULL)
+    return 404;
+
+  playlist = http_arg_get(&hc->hc_req_args, "playlist");
+  if (playlist) {
+    if (strcmp(playlist, "xspf") == 0)
+      return page_xspf(hc, remain, opaque);
+    if (strcmp(playlist, "m3u") == 0)
+      return page_m3u(hc, remain, opaque);
+  }
+  if (webui_xspf)
+    return page_xspf(hc, remain, opaque);
+  return page_m3u(hc, remain, opaque);
 }
 
 /**
