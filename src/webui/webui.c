@@ -427,6 +427,9 @@ http_stream_run(http_connection_t *hc, streaming_queue_t *sq,
 /**
  * HTTP stream dvrfile loop
  */
+
+#define MAX_DVR_READ 64*1024
+
 static void
 http_stream_dvrfile_run(http_connection_t *hc, streaming_queue_t *sq,
 		const char *name, muxer_container_type_t mc,
@@ -441,6 +444,12 @@ http_stream_dvrfile_run(http_connection_t *hc, streaming_queue_t *sq,
   struct timeval  tp;
   int err = 0;
   socklen_t errlen = sizeof(err);
+#if defined(PLATFORM_LINUX)
+  ssize_t r;
+#elif defined(PLATFORM_FREEBSD) || defined(PLATFORM_DARWIN)
+  off_t r;
+#endif
+  char buffer[MAX_DVR_READ];
 
   mux = muxer_create(mc, mcfg);
   if(muxer_open_stream(mux, hc->hc_fd))
@@ -475,6 +484,11 @@ http_stream_dvrfile_run(http_connection_t *hc, streaming_queue_t *sq,
       pthread_mutex_unlock(&sq->sq_mutex);
 
       // Read from input.
+      r = read(fd, &buffer, MAX_DRV_READ); 
+      if (r == -1)
+        run = 0;
+
+      
       continue;
     }
 
