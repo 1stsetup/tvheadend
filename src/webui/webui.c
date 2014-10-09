@@ -59,6 +59,10 @@
 #include <sys/socket.h>
 #endif
 
+#if ENABLE_LIBAV
+#include <libavformat/avformat.h>
+#endif
+
 static int webui_xspf;
 
 /**
@@ -424,16 +428,15 @@ http_stream_run(http_connection_t *hc, streaming_queue_t *sq,
 }
 
 
+#ifdef ENABLE_LIBAV
 /**
  * HTTP stream dvrfile loop
  */
 
-#define MAX_DVR_READ 64*1024
-
 static void
 http_stream_dvrfile_run(http_connection_t *hc, streaming_queue_t *sq,
 		const char *name, muxer_container_type_t mc,
-                int fd, streaming_target_t *st, muxer_config_t *mcfg)
+                AVFormatContext *fmt_ctx, streaming_target_t *st, muxer_config_t *mcfg)
 {
   streaming_message_t *sm;
   int run = 1;
@@ -444,12 +447,7 @@ http_stream_dvrfile_run(http_connection_t *hc, streaming_queue_t *sq,
   struct timeval  tp;
   int err = 0;
   socklen_t errlen = sizeof(err);
-#if defined(PLATFORM_LINUX)
-  ssize_t r;
-#elif defined(PLATFORM_FREEBSD) || defined(PLATFORM_DARWIN)
-  off_t r;
-#endif
-  char buffer[MAX_DVR_READ];
+  AVPacket input_packet;
 
   mux = muxer_create(mc, mcfg);
   if(muxer_open_stream(mux, hc->hc_fd))
@@ -462,33 +460,42 @@ http_stream_dvrfile_run(http_connection_t *hc, streaming_queue_t *sq,
 
   while(run && tvheadend_running) {
     pthread_mutex_lock(&sq->sq_mutex);
-    sm = TAILQ_FIRST(&sq->sq_queue);
-    if(sm == NULL) {      
-      gettimeofday(&tp, NULL);
-      ts.tv_sec  = tp.tv_sec + 1;
-      ts.tv_nsec = tp.tv_usec * 1000;
 
-      if(pthread_cond_timedwait(&sq->sq_cond, &sq->sq_mutex, &ts) == ETIMEDOUT) {
-          timeouts++;
+    av_init_packet(&input_packet);
+    input_packet.data = NULL;
+    input_packet.size = 0;
 
-          //Check socket status
-          getsockopt(hc->hc_fd, SOL_SOCKET, SO_ERROR, (char *)&err, &errlen);  
-          if (err) {
-              tvhlog(LOG_DEBUG, "webui",  "Stop streaming %s, client hung up", hc->hc_url_orig);
-              run = 0;
-          } else if(timeouts >= grace) {
-              tvhlog(LOG_WARNING, "webui",  "Stop streaming %s, timeout waiting for packets", hc->hc_url_orig);
-              run = 0;
-          }
-      }
-      pthread_mutex_unlock(&sq->sq_mutex);
-
-      // Read from input.
-      r = read(fd, &buffer, MAX_DRV_READ); 
-      if (r == -1)
-        run = 0;
+    if (av_read_frame(fmt_ctx, &input_packet)) {
 
       
+      av_free_packet(&input_packet);
+
+      sm = TAILQ_FIRST(&sq->sq_queue);
+      if(sm == NULL) {      
+        gettimeofday(&tp, NULL);
+        ts.tv_sec  = tp.tv_sec + 1;
+        ts.tv_nsec = tp.tv_usec * 1000;
+
+        if(pthread_cond_timedwait(&sq->sq_cond, &sq->sq_mutex, &ts) == ETIMEDOUT) {
+            timeouts++;
+
+            //Check socket status
+            getsockopt(hc->hc_fd, SOL_SOCKET, SO_ERROR, (char *)&err, &errlen);  
+            if (err) {
+                tvhlog(LOG_DEBUG, "webui",  "Stop streaming %s, client hung up", hc->hc_url_orig);
+                run = 0;
+            } else if(timeouts >= grace) {
+                tvhlog(LOG_WARNING, "webui",  "Stop streaming %s, timeout waiting for packets", hc->hc_url_orig);
+                run = 0;
+            }
+        }
+        pthread_mutex_unlock(&sq->sq_mutex);
+
+        continue;
+      }
+    }
+    else {
+      run = 0;
       continue;
     }
 
@@ -578,6 +585,7 @@ http_stream_dvrfile_run(http_connection_t *hc, streaming_queue_t *sq,
 
   muxer_destroy(mux);
 }
+#endif
 
 /**
  * Output a playlist containing a single channel
@@ -1169,6 +1177,7 @@ http_stream_channel(http_connection_t *hc, channel_t *ch, int weight)
 }
 
 
+#if ENABLE_LIBAV
 /**
  * Open dvr file and stream.
  */
@@ -1182,9 +1191,7 @@ http_stream_dvrfile(http_connection_t *hc, dvr_entry_t *de, int weight)
   streaming_target_t *gh;
   streaming_target_t *tsfix;
   streaming_target_t *st;
-#if ENABLE_LIBAV
   streaming_target_t *tr = NULL;
-#endif
   dvr_config_t *cfg;
   int flags = SUBSCRIPTION_STREAMING;
   muxer_container_type_t mc;
@@ -1194,12 +1201,11 @@ http_stream_dvrfile(http_connection_t *hc, dvr_entry_t *de, int weight)
   //char addrbuf[50];
   void *tcp_id;
   int res = 0;
-  struct stat fdstat;
-  int fd;
+  AVFormatContext *fmt_ctx = NULL;
 
   fname = strdup(de->de_filename);
   content = muxer_container_type2mime(de->de_mc, 1);
-  tvhlog(LOG_ERR, "webui", "http_stream_dvrfile: fname:%s, content:%s", fname, content);
+  tvhlog(LOG_INFO, "webui", "http_stream_dvrfile: fname:%s, content:%s", fname, content);
 
   if((tcp_id = http_stream_preop(hc)) == NULL)
     return HTTP_STATUS_NOT_ALLOWED;
@@ -1226,44 +1232,49 @@ http_stream_dvrfile(http_connection_t *hc, dvr_entry_t *de, int weight)
   } else {
     streaming_queue_init2(&sq, 0, qsize);
     gh = globalheaders_create(&sq.sq_st);
-#if ENABLE_LIBAV
     transcoder_props_t props;
     if(http_get_transcoder_properties(&hc->hc_req_args, &props)) {
       tr = transcoder_create(gh);
       transcoder_set_properties(tr, &props);
       tsfix = tsfix_create(tr);
     } else
-#endif
     tsfix = tsfix_create(gh);
     st = tsfix;
   }
 
-  fd = tvh_open(fname, O_RDONLY, 0);
-  free(fname);
+  if ((res = avformat_open_input(&fmt_ctx, fname, NULL, NULL)) == 0) {
+    if ((res = avformat_find_stream_info(fmt_ctx, NULL)) >= 0) {
 
-  if ((fd >= 0) && (fstat(fd, &fdstat) < 0)) {
-    close(fd);
-    fd = -1;
-    res = 404;
-  }
+      int streamcount;
+      for (streamcount = 0; streamcount < fmt_ctx->nb_streams; streamcount++) {
+        tvhlog(LOG_INFO, "webui", "http_stream_dvrfile: stream:%d, codec:%d, codec_type=%d", streamcount, fmt_ctx->streams[streamcount]->codec->codec_id, fmt_ctx->streams[streamcount]->codec->codec_type);
+      }
 
-  if(fd >= 0) {
-    name = tvh_strdupa(de->de_channel_name);
-    pthread_mutex_unlock(&global_lock);
-    http_stream_dvrfile_run(hc, &sq, name, mc, fd, st, &cfg->dvr_muxcnf);
-    pthread_mutex_lock(&global_lock);
-    close(fd);
+      name = tvh_strdupa(de->de_channel_name);
+      pthread_mutex_unlock(&global_lock);
+      http_stream_dvrfile_run(hc, &sq, name, mc, fmt_ctx, st, &cfg->dvr_muxcnf);
+      pthread_mutex_lock(&global_lock);
+      avformat_close_input(&fmt_ctx);
+    } else {
+      static char error_buffer[255];
+      av_strerror(res, error_buffer, sizeof(error_buffer));
+      tvhlog(LOG_ERR, "webui", "http_stream_dvrfile: Error finding input stream info for dvr file '%s'. Error: %s", fname, error_buffer);
+      res = HTTP_STATUS_BAD_REQUEST;
+    }
   } else {
+    static char error_buffer[255];
+    av_strerror(res, error_buffer, sizeof(error_buffer));
+    tvhlog(LOG_ERR, "webui", "http_stream_dvrfile: Error opening dvr file '%s'. Error: %s", fname, error_buffer);
     res = HTTP_STATUS_BAD_REQUEST;
   }
+
+  free(fname);
 
   if(gh)
     globalheaders_destroy(gh);
 
-#if ENABLE_LIBAV
   if(tr)
     transcoder_destroy(tr);
-#endif
 
   if(tsfix)
     tsfix_destroy(tsfix);
@@ -1274,6 +1285,7 @@ http_stream_dvrfile(http_connection_t *hc, dvr_entry_t *de, int weight)
 
   return res;
 }
+#endif
 
 /**
  * Download a recorded file
@@ -1468,7 +1480,7 @@ http_stream(http_connection_t *hc, const char *remain, void *opaque)
 #endif
   } else if(de != NULL) {
 #if ENABLE_LIBAV
-      return http_stream_dvrfile(hc, de, weight);
+      return 	http_stream_dvrfile(hc, de, weight);
 #else
       return page_dvrfile(hc, remain, opaque);
 #endif
