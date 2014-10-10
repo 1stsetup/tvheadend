@@ -448,10 +448,18 @@ http_stream_dvrfile_run(http_connection_t *hc, streaming_queue_t *sq,
   int err = 0;
   socklen_t errlen = sizeof(err);
   AVPacket input_packet;
+  int first_seen[255];
+  int i;
+
+  for(i=0; i<255; i++) {
+    first_seen[i]=0;
+  }
 
   mux = muxer_create(mc, mcfg);
   if(muxer_open_stream(mux, hc->hc_fd))
     run = 0;
+
+  tvhlog(LOG_INFO, "webui", "http_stream_dvrfile_run:  run=%d", run);
 
   /* reduce timeout on write() for streaming */
   tp.tv_sec  = 5;
@@ -465,8 +473,20 @@ http_stream_dvrfile_run(http_connection_t *hc, streaming_queue_t *sq,
     input_packet.data = NULL;
     input_packet.size = 0;
 
-    if (av_read_frame(fmt_ctx, &input_packet)) {
+    if (av_read_frame(fmt_ctx, &input_packet) == 0) {
 
+      if (fmt_ctx->streams[input_packet.stream_index]->codec->codec_type == AVMEDIA_TYPE_VIDEO) {
+        tvhlog(LOG_INFO, "webui", "http_stream_dvrfile_run:  VIDEO packet for stream:%d, width:%d, height=%d", input_packet.stream_index, fmt_ctx->streams[input_packet.stream_index]->codec->width, fmt_ctx->streams[input_packet.stream_index]->codec->height);
+      }
+      else if (fmt_ctx->streams[input_packet.stream_index]->codec->codec_type == AVMEDIA_TYPE_AUDIO) {
+        tvhlog(LOG_INFO, "webui", "http_stream_dvrfile_run:  AUDIO packet for stream:%d", input_packet.stream_index);
+      }
+      else if (fmt_ctx->streams[input_packet.stream_index]->codec->codec_type == AVMEDIA_TYPE_SUBTITLE) {
+        tvhlog(LOG_INFO, "webui", "http_stream_dvrfile_run:  SUBTITLE packet for stream:%d", input_packet.stream_index);
+      }
+      else {
+        tvhlog(LOG_INFO, "webui", "http_stream_dvrfile_run:  OTHER packet for stream:%d", input_packet.stream_index);
+      }
       
       av_free_packet(&input_packet);
 
