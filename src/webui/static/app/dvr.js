@@ -160,8 +160,8 @@ tvheadend.dvr_upcoming = function(panel, index) {
         url: 'api/dvr/entry',
         gridURL: 'api/dvr/entry/grid_upcoming',
         titleS: 'Upcoming Recording',
-        titleP: 'Upcoming Recordings',
-        iconCls: 'clock',
+        titleP: 'Upcoming / Current Recordings',
+        iconCls: 'upcomingRec',
         tabIndex: index,
         add: {
             url: 'api/dvr/entry',
@@ -233,7 +233,7 @@ tvheadend.dvr_finished = function(panel, index) {
         readonly: true,
         titleS: 'Finished Recording',
         titleP: 'Finished Recordings',
-        iconCls: 'television',
+        iconCls: 'finishedRec',
         tabIndex: index,
         del: true,
         list: 'disp_title,episode,start_real,stop_real,' +
@@ -271,7 +271,7 @@ tvheadend.dvr_finished = function(panel, index) {
         tbar: [downloadButton],
         selected: selected,
         help: function() {
-            new tvheadend.help('DVR', 'config_dvrlog.html');
+            new tvheadend.help('DVR-Finished Recordings', 'dvrfinished.html');
         },
     });
 

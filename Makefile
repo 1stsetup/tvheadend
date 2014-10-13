@@ -49,6 +49,14 @@ LDFLAGS += -lrt
 endif
 endif
 
+ifeq ($(CONFIG_LIBFFMPEG_STATIC),yes)
+CFLAGS  += -I${ROOTDIR}/libav_static/build/ffmpeg/include
+LDFLAGS += -L${ROOTDIR}/libav_static/build/ffmpeg/lib -Wl,-Bstatic \
+           -lavresample -lswresample -lswscale -lavformat -lavcodec -lavutil \
+           -lvorbisenc -lvorbis -logg -lx264 -lvpx \
+           -Wl,-Bdynamic
+endif
+
 ifeq ($(COMPILER), clang)
 CFLAGS  += -Wno-microsoft -Qunused-arguments -Wno-unused-function
 CFLAGS  += -Wno-unused-value -Wno-tautological-constant-out-of-range-compare
@@ -282,9 +290,11 @@ SRCS-$(CONFIG_AVAHI) += src/avahi.c
 SRCS-$(CONFIG_BONJOUR) += src/bonjour.c
 
 # libav
-SRCS-$(CONFIG_LIBAV) += src/libav.c \
+SRCS_LIBAV = \
+	src/libav.c \
 	src/muxer/muxer_libav.c \
-	src/plumbing/transcoding.c \
+	src/plumbing/transcoding.c
+SRCS-$(CONFIG_LIBAV) += $(SRCS_LIBAV)
 
 # Tvhcsa
 SRCS-${CONFIG_TVHCSA} += \
@@ -347,6 +357,10 @@ OBJS       = $(SRCS:%.c=$(BUILDDIR)/%.o)
 OBJS_EXTRA = $(SRCS_EXTRA:%.c=$(BUILDDIR)/%.so)
 DEPS       = ${OBJS:%.o=%.d}
 
+ifeq ($(CONFIG_LIBFFMPEG_STATIC),yes)
+DEPS      += ${BUILDDIR}/libffmpeg_stamp
+endif
+
 #
 # Build Rules
 #
@@ -387,6 +401,7 @@ clean:
 	find . -name "*~" | xargs rm -f
 
 distclean: clean
+	rm -rf ${ROOTDIR)/.tvh${ROOTDIR}/libav_static
 	rm -rf ${ROOTDIR}/build.*
 	rm -f ${ROOTDIR}/.config.mk
 
@@ -411,12 +426,25 @@ $(BUILDDIR)/bundle.c: check_dvb_scan
 	@mkdir -p $(dir $@)
 	$(MKBUNDLE) -o $@ -d ${BUILDDIR}/bundle.d $(BUNDLE_FLAGS) $(BUNDLES:%=$(ROOTDIR)/%)
 
+# Static FFMPEG
+
+ifeq ($(CONFIG_LIBFFMPEG_STATIC),yes)
+${ROOTDIR}/src/libav.h: ${BUILDDIR}/libffmpeg_stamp
+${SRCS_LIBAV}: ${BUILDDIR}/libffmpeg_stamp
+endif
+
+${BUILDDIR}/libffmpeg_stamp: ${ROOTDIR}/libav_static/build/ffmpeg/lib/libavcodec.a
+	@touch $@
+
+${ROOTDIR}/libav_static/build/ffmpeg/lib/libavcodec.a:
+	$(MAKE) -f Makefile.ffmpeg build
+
 # linuxdvb git tree
 $(ROOTDIR)/data/dvb-scan/.stamp:
 	@echo "Receiving data/dvb-scan/dvb-t from http://linuxtv.org/git/dtv-scan-tables.git"
 	@rm -rf $(ROOTDIR)/data/dvb-scan/*
 	@$(ROOTDIR)/support/getmuxlist $(ROOTDIR)/data/dvb-scan
-	@touch $(ROOTDIR)/data/dvb-scan/.stamp
+	@touch $@
 
 .PHONY: check_dvb_scan
 check_dvb_scan: $(ROOTDIR)/data/dvb-scan/.stamp
