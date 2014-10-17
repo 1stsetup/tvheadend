@@ -22,6 +22,10 @@
 #include "string.h"
 #include "atomic.h"
 
+#ifndef PKTBUF_DATA_ALIGN
+#define PKTBUF_DATA_ALIGN 64
+#endif
+
 /*
  *
  */

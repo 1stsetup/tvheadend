@@ -18,6 +18,8 @@
 
 #include "input.h"
 #include "subscriptions.h"
+#include "channels.h"
+#include "access.h"
 #include "dvb_charset.h"
 
 #include <assert.h>
@@ -77,6 +79,24 @@ mpegts_network_class_get_num_svc ( void *ptr )
 }
 
 static const void *
+mpegts_network_class_get_num_chn ( void *ptr )
+{
+  static int n;
+  mpegts_mux_t *mm;
+  mpegts_service_t *s;
+  mpegts_network_t *mn = ptr;
+  channel_service_mapping_t *csm;
+
+  n = 0;
+  LIST_FOREACH(mm, &mn->mn_muxes, mm_network_link)
+    LIST_FOREACH(s, &mm->mm_services, s_dvb_mux_link)
+      LIST_FOREACH(csm, &s->s_channels, csm_svc_link)
+        n++;
+
+  return &n;
+}
+
+static const void *
 mpegts_network_class_get_scanq_length ( void *ptr )
 {
   static __thread int n;
@@ -109,8 +129,9 @@ const idclass_t mpegts_network_class =
 {
   .ic_class      = "mpegts_network",
   .ic_caption    = "MPEGTS Network",
-  .ic_save       = mpegts_network_class_save,
   .ic_event      = "mpegts_network",
+  .ic_perm_def   = ACCESS_ADMIN,
+  .ic_save       = mpegts_network_class_save,
   .ic_get_title  = mpegts_network_class_get_title,
   .ic_properties = (const property_t[]){
     {
@@ -150,6 +171,13 @@ const idclass_t mpegts_network_class =
       .notify   = mpegts_network_class_idlescan_notify,
     },
     {
+      .type     = PT_BOOL,
+      .id       = "ignore_chnum",
+      .name     = "Ignore Provider's Channel Numbers",
+      .off      = offsetof(mpegts_network_t, mn_ignore_chnum),
+      .def.i    = 0,
+    },
+    {
       .type     = PT_STR,
       .id       = "charset",
       .name     = "Character Set",
@@ -170,6 +198,13 @@ const idclass_t mpegts_network_class =
       .name     = "# Services",
       .opts     = PO_RDONLY | PO_NOSAVE,
       .get      = mpegts_network_class_get_num_svc,
+    },
+    {
+      .type     = PT_INT,
+      .id       = "num_chn",
+      .name     = "# Channels",
+      .opts     = PO_RDONLY | PO_NOSAVE,
+      .get      = mpegts_network_class_get_num_chn,
     },
     {
       .type     = PT_INT,

@@ -36,6 +36,7 @@
 #include "streaming.h"
 #include "channels.h"
 #include "service.h"
+#include "profile.h"
 #include "htsmsg.h"
 #include "notify.h"
 #include "atomic.h"
@@ -50,10 +51,10 @@ static int                  subscription_postpone;
 /**
  *
  */
-int
-subscriptions_active(void)
+static inline int
+shortid(th_subscription_t *s)
 {
-  return LIST_FIRST(&subscriptions) != NULL;
+  return s->ths_id & 0xffff;
 }
 
 /* **************************************************************************
@@ -72,7 +73,7 @@ subscription_link_service(th_subscription_t *s, service_t *t)
   s->ths_service = t;
   LIST_INSERT_HEAD(&t->s_subscriptions, s, ths_service_link);
 
-  tvhtrace("subscription", "linking sub %p to svc %p", s, t);
+  tvhtrace("subscription", "%04X: linking sub %p to svc %p", shortid(s), s, t);
 
   pthread_mutex_lock(&t->s_stream_mutex);
 
@@ -121,7 +122,7 @@ subscription_unlink_service0(th_subscription_t *s, int reason, int stop)
   /* Ignore - not actually linked */
   if (!s->ths_current_instance) return;
 
-  tvhtrace("subscription", "unlinking sub %p from svc %p", s, t);
+  tvhtrace("subscription", "%04X: unlinking sub %p from svc %p", shortid(s), s, t);
 
   pthread_mutex_lock(&t->s_stream_mutex);
 
@@ -197,9 +198,9 @@ subscription_show_none(th_subscription_t *s)
 {
   channel_t *ch = s->ths_channel;
   tvhlog(LOG_NOTICE, "subscription",
-	 "No transponder available for subscription \"%s\" "
+	 "%04X: No transponder available for subscription \"%s\" "
 	 "to channel \"%s\"",
-	   s->ths_title, ch ? channel_get_name(ch) : "none");
+	   shortid(s), s->ths_title, ch ? channel_get_name(ch) : "none");
 }
 
 static void
@@ -232,7 +233,7 @@ subscription_show_info(th_subscription_t *s)
              s->ths_client   ?: "<N/A>");
   }
 
-  tvhlog(LOG_INFO, "subscription", "%s", buf);
+  tvhlog(LOG_INFO, "subscription", "%04X: %s", shortid(s), buf);
 }
 
 /**
@@ -305,24 +306,36 @@ subscription_reschedule(void)
 
     error = s->ths_testing_error;
     if (s->ths_channel)
-      tvhtrace("subscription", "find service for %s weight %d",
-               channel_get_name(s->ths_channel), s->ths_weight);
+      tvhtrace("subscription", "%04X: find service for %s weight %d",
+               shortid(s), channel_get_name(s->ths_channel), s->ths_weight);
     else
-      tvhtrace("subscription", "find instance for %s weight %d",
-               s->ths_service->s_nicename, s->ths_weight);
+      tvhtrace("subscription", "%04X: find instance for %s weight %d",
+               shortid(s), s->ths_service->s_nicename, s->ths_weight);
     si = service_find_instance(s->ths_service, s->ths_channel,
                                &s->ths_instances, &error, s->ths_weight,
-                               s->ths_flags,
+                               s->ths_flags, s->ths_timeout,
                                dispatch_clock > s->ths_postpone_end ?
                                  0 : s->ths_postpone_end - dispatch_clock);
     s->ths_current_instance = si;
 
     if(si == NULL) {
       if (s->ths_last_error != error || s->ths_last_find + 2 >= dispatch_clock) {
-        tvhtrace("subscription", "instance not available, retrying");
+        tvhtrace("subscription", "%04X: instance not available, retrying", shortid(s));
         if (s->ths_last_error != error)
           s->ths_last_find = dispatch_clock;
         s->ths_last_error = error;
+        continue;
+      }
+      if (s->ths_flags & SUBSCRIPTION_RESTART) {
+        if (s->ths_channel)
+          tvhwarn("subscription", "%04X: restarting channel %s",
+                  shortid(s), channel_get_name(s->ths_channel));
+        else
+          tvhwarn("subscription", "%04X: restarting service %s",
+                  shortid(s), s->ths_service->s_nicename);
+        s->ths_testing_error = 0;
+        s->ths_current_instance = NULL;
+        service_instance_list_clear(&s->ths_instances);
         continue;
       }
       /* No service available */
@@ -528,7 +541,7 @@ subscription_unsubscribe(th_subscription_t *s)
              s->ths_username ?: "<N/A>",
              s->ths_client   ?: "<N/A>");
   }
-  tvhlog(LOG_INFO, "subscription", "%s", buf);
+  tvhlog(LOG_INFO, "subscription", "%04X: %s", shortid(s), buf);
 
   if(t)
     service_remove_subscriber(t, s, SM_CODE_OK);
@@ -564,7 +577,7 @@ subscription_unsubscribe(th_subscription_t *s)
  */
 th_subscription_t *
 subscription_create
-  (int weight, const char *name, streaming_target_t *st,
+  (profile_t *pro, int weight, const char *name, streaming_target_t *st,
    int flags, st_callback_t *cb, const char *hostname,
    const char *username, const char *client)
 {
@@ -596,8 +609,12 @@ subscription_create
   s->ths_total_err         = 0;
   s->ths_output            = st;
   s->ths_flags             = flags;
+  s->ths_timeout           = pro ? pro->pro_timeout : 0;
   s->ths_postpone          = subscription_postpone;
   s->ths_postpone_end      = dispatch_clock + s->ths_postpone;
+
+  if (pro && pro->pro_restart)
+    s->ths_flags |= SUBSCRIPTION_RESTART;
 
   time(&s->ths_start);
 
@@ -616,21 +633,29 @@ subscription_create
  *
  */
 static th_subscription_t *
-subscription_create_from_channel_or_service
-  (channel_t *ch, service_t *t, unsigned int weight, 
-   const char *name, streaming_target_t *st,
-   int flags, const char *hostname,
-   const char *username, const char *client)
+subscription_create_from_channel_or_service(channel_t *ch,
+                                            service_t *t,
+                                            profile_t *pro,
+                                            unsigned int weight,
+                                            const char *name,
+                                            streaming_target_t *st,
+                                            int flags,
+                                            const char *hostname,
+                                            const char *username,
+                                            const char *client)
 {
   th_subscription_t *s;
   assert(!ch || !t);
   assert(st);
 
-  if (ch)
-    tvhtrace("subscription", "creating subscription for %s weight %d",
-             channel_get_name(ch), weight);
-  s = subscription_create(weight, name, st, flags, subscription_input,
+  s = subscription_create(pro, weight, name, st, flags, subscription_input,
                           hostname, username, client);
+  if (ch)
+    tvhtrace("subscription", "%04X: creating subscription for %s weight %d",
+             shortid(s), channel_get_name(ch), weight);
+  else
+    tvhtrace("subscription", "%04X: creating subscription for service %s weight %d",
+             shortid(s), t->s_nicename, weight);
   s->ths_channel = ch;
   s->ths_service = t;
   if (ch)
@@ -641,27 +666,29 @@ subscription_create_from_channel_or_service
 }
 
 th_subscription_t *
-subscription_create_from_channel(channel_t *ch, unsigned int weight, 
+subscription_create_from_channel(channel_t *ch, profile_t *pro,
+                                 unsigned int weight,
 				 const char *name, streaming_target_t *st,
 				 int flags, const char *hostname,
 				 const char *username, const char *client)
 {
   return subscription_create_from_channel_or_service
-           (ch, NULL, weight, name, st, flags, hostname, username, client);
+           (ch, NULL, pro, weight, name, st, flags, hostname, username, client);
 }
 
 /**
  *
  */
 th_subscription_t *
-subscription_create_from_service(service_t *t, unsigned int weight,
+subscription_create_from_service(service_t *t, profile_t *pro,
+                                 unsigned int weight,
                                  const char *name,
 				 streaming_target_t *st, int flags,
 				 const char *hostname, const char *username, 
 				 const char *client)
 {
   return subscription_create_from_channel_or_service
-           (NULL, t, weight, name, st, flags, hostname, username, client);
+           (NULL, t, pro, weight, name, st, flags, hostname, username, client);
 }
 
 /**
@@ -706,20 +733,20 @@ mux_data_timeout ( void *aux )
   }
   mi->mi_live = 0;
 
-  gtimer_arm(&s->ths_receive_timer, mux_data_timeout, s, 5);
+  if (s->ths_timeout > 0)
+    gtimer_arm(&s->ths_receive_timer, mux_data_timeout, s, s->ths_timeout);
 }
 
 th_subscription_t *
-subscription_create_from_mux
-  (mpegts_mux_t *mm,
-   unsigned int weight,
-   const char *name,
-   streaming_target_t *st,
-   int flags,
-   const char *hostname,
-   const char *username, 
-   const char *client,
-   int *err)
+subscription_create_from_mux(mpegts_mux_t *mm, profile_t *pro,
+                             unsigned int weight,
+                             const char *name,
+                             streaming_target_t *st,
+                             int flags,
+                             const char *hostname,
+                             const char *username,
+                             const char *client,
+                             int *err)
 {
   th_subscription_t *s;
   streaming_message_t *sm;
@@ -737,7 +764,7 @@ subscription_create_from_mux
   /* Create subscription */
   if (!st)
     flags |= SUBSCRIPTION_NONE;
-  s = subscription_create(weight, name, st, flags, NULL,
+  s = subscription_create(pro, weight, name, st, flags, NULL,
                           hostname, username, client);
   s->ths_mmi = mm->mm_active;
 
@@ -769,9 +796,10 @@ subscription_create_from_mux
   ss->ss_si.si_service = strdup("rawmux");
 
   tvhinfo("subscription", 
-	  "'%s' subscribing to mux, weight: %d, adapter: '%s', "
-	  "network: '%s', mux: '%s', hostname: '%s', username: '%s', "
-	  "client: '%s'",
+	  "%04X: \"%s\" subscribing to mux, weight: %d, adapter: \"%s\", "
+	  "network: \"%s\", mux: \"%s\", hostname: \"%s\", username: \"%s\", "
+	  "client: \"%s\"",
+	  shortid(s),
 	  s->ths_title,
           s->ths_weight,
 	  ss->ss_si.si_adapter  ?: "<N/A>",
@@ -790,7 +818,8 @@ subscription_create_from_mux
 
   pthread_mutex_unlock(&mi->mi_output_lock);
 
-  gtimer_arm(&s->ths_receive_timer, mux_data_timeout, s, r);
+  if (r > 0)
+    gtimer_arm(&s->ths_receive_timer, mux_data_timeout, s, r);
 
   return s;
 }
@@ -1029,6 +1058,7 @@ subscription_dummy_join(const char *id, int first)
 {
   service_t *t = service_find_by_identifier(id);
   streaming_target_t *st;
+  th_subscription_t *s;
 
   if(first) {
     gtimer_arm(&dummy_sub_timer, dummy_retry, strdup(id), 2);
@@ -1045,10 +1075,8 @@ subscription_dummy_join(const char *id, int first)
 
   st = calloc(1, sizeof(streaming_target_t));
   streaming_target_init(st, dummy_callback, NULL, 0);
-  subscription_create_from_service(t, 1, "dummy", st, 0, NULL, NULL, "dummy");
+  s = subscription_create_from_service(t, NULL, 1, "dummy", st, 0, NULL, NULL, "dummy");
 
-  tvhlog(LOG_NOTICE, "subscription", 
-	 "Dummy join %s ok", id);
+  tvhlog(LOG_NOTICE, "subscription",
+         "%04X: Dummy join %s ok", shortid(s), id);
 }
-
-

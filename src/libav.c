@@ -30,6 +30,11 @@ libav_log_callback(void *ptr, int level, const char *fmt, va_list vl)
     else if(level == AV_LOG_PANIC)
       level = LOG_EMERG;
 
+    if (level == LOG_INFO) {
+      if (!strncmp(message, "--prefix=/", 10))
+        return;
+    }
+
     while(l < message + sizeof(message)) {
       nl = strstr(l, "\n");
       if(nl)
@@ -64,6 +69,9 @@ streaming_component_type2codec_id(streaming_component_type_t type)
     break;
   case SCT_VP8:
     codec_id = AV_CODEC_ID_VP8;
+    break;
+  case SCT_VP9:
+    codec_id = AV_CODEC_ID_VP9;
     break;
   case SCT_AC3:
     codec_id = AV_CODEC_ID_AC3;
@@ -115,6 +123,9 @@ codec_id2streaming_component_type(enum AVCodecID id)
     break;
   case AV_CODEC_ID_VP8:
     type = SCT_VP8;
+    break;
+  case AV_CODEC_ID_VP9:
+    type = SCT_VP9;
     break;
   case AV_CODEC_ID_AC3:
     type = SCT_AC3;

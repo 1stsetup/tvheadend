@@ -291,6 +291,7 @@ struct mpegts_network
   int      mn_skipinitscan;
   char    *mn_charset;
   int      mn_idlescan;
+  int      mn_ignore_chnum;
 };
 
 typedef enum mpegts_mux_scan_state
@@ -434,6 +435,7 @@ struct mpegts_service
   char    *s_dvb_charset;
   uint16_t s_dvb_prefcapid;
   int      s_dvb_prefcapid_lock;
+  uint16_t s_dvb_forcecaid;
 
   /*
    * EIT/EPG control

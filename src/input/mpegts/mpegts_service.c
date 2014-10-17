@@ -168,6 +168,13 @@ const idclass_t mpegts_service_class =
       .opts     = PO_ADVANCED,
       .list     = mpegts_service_pref_capid_lock_list,
     },
+    {
+      .type     = PT_U16,
+      .id       = "force_caid",
+      .name     = "Force CA ID (e.g. 0x2600)",
+      .off      = offsetof(mpegts_service_t, s_dvb_forcecaid),
+      .opts     = PO_ADVANCED | PO_HEXA,
+    },
     {},
   }
 };
@@ -376,10 +383,15 @@ mpegts_service_grace_period(service_t *t)
 static int64_t
 mpegts_service_channel_number ( service_t *s )
 {
-  int r = ((mpegts_service_t*)s)->s_dvb_channel_num * CHANNEL_SPLIT +
-          ((mpegts_service_t*)s)->s_dvb_channel_minor;
+  mpegts_service_t *ms = (mpegts_service_t*)s;
+  int r;
+
+  if (ms->s_dvb_mux->mm_network->mn_ignore_chnum)
+    return 0;
+
+  r = ms->s_dvb_channel_num * CHANNEL_SPLIT + ms->s_dvb_channel_minor;
   if (r <= 0)
-    r = ((mpegts_service_t*)s)->s_dvb_opentv_chnum * CHANNEL_SPLIT;
+    r = ms->s_dvb_opentv_chnum * CHANNEL_SPLIT;
   return r;
 }
 
@@ -398,10 +410,9 @@ mpegts_service_provider_name ( service_t *s )
 static const char *
 mpegts_service_channel_icon ( service_t *s )
 {
-  mpegts_service_t *ms = (mpegts_service_t*)s;
-
   /* DVB? */
 #if ENABLE_MPEGTS_DVB
+  mpegts_service_t *ms = (mpegts_service_t*)s;
   extern const idclass_t dvb_mux_class;
   if (ms->s_dvb_mux &&
       idnode_is_instance(&ms->s_dvb_mux->mm_id, &dvb_mux_class)) {

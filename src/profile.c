@@ -20,6 +20,7 @@
 #include "settings.h"
 #include "profile.h"
 #include "streaming.h"
+#include "access.h"
 #include "plumbing/tsfix.h"
 #include "plumbing/globalheaders.h"
 #if ENABLE_LIBAV
@@ -82,6 +83,7 @@ profile_create
     return NULL;
   }
   LIST_INIT(&pro->pro_dvr_configs);
+  LIST_INIT(&pro->pro_accesses);
   if (idnode_insert(&pro->pro_id, uuid, pb->clazz, 0)) {
     if (uuid)
       tvherror("profile", "invalid uuid '%s'", uuid);
@@ -113,6 +115,7 @@ profile_delete(profile_t *pro, int delconf)
   TAILQ_REMOVE(&profiles, pro, pro_link);
   idnode_unlink(&pro->pro_id);
   dvr_config_destroy_by_profile(pro, delconf);
+  access_destroy_by_profile(pro, delconf);
   if (pro->pro_free)
     pro->pro_free(pro);
   free(pro->pro_name);
@@ -218,8 +221,9 @@ const idclass_t profile_class =
 {
   .ic_class      = "profile",
   .ic_caption    = "Stream Profile",
-  .ic_save       = profile_class_save,
   .ic_event      = "profile",
+  .ic_perm_def   = ACCESS_ADMIN,
+  .ic_save       = profile_class_save,
   .ic_get_title  = profile_class_get_title,
   .ic_delete     = profile_class_delete,
   .ic_properties = (const property_t[]){
@@ -259,6 +263,20 @@ const idclass_t profile_class =
       .name     = "Comment",
       .off      = offsetof(profile_t, pro_comment),
     },
+    {
+      .type     = PT_INT,
+      .id       = "timeout",
+      .name     = "Timeout (sec) (0=infinite)",
+      .off      = offsetof(profile_t, pro_timeout),
+      .def.i    = 5,
+    },
+    {
+      .type     = PT_BOOL,
+      .id       = "restart",
+      .name     = "Restart On Error",
+      .off      = offsetof(profile_t, pro_restart),
+      .def.i    = 0,
+    },
     { }
   }
 };
@@ -277,21 +295,66 @@ profile_get_name(profile_t *pro)
  *
  */
 profile_t *
-profile_find_by_name(const char *name)
+profile_find_by_name(const char *name, const char *alt)
 {
   profile_t *pro;
 
   lock_assert(&global_lock);
 
+  if (!name && alt) {
+    name = alt;
+    alt = NULL;
+  }
+
   if (!name)
     return profile_default;
 
   TAILQ_FOREACH(pro, &profiles, pro_link) {
-    if (!strcmp(pro->pro_name, name))
+    if (pro->pro_enabled && !strcmp(pro->pro_name, name))
       return pro;
   }
 
+  if (alt) {
+    TAILQ_FOREACH(pro, &profiles, pro_link) {
+      if (pro->pro_enabled && !strcmp(pro->pro_name, alt))
+        return pro;
+    }
+  }
+
   return profile_default;
+}
+
+/*
+ *
+ */
+profile_t *
+profile_find_by_list(htsmsg_t *uuids, const char *name, const char *alt)
+{
+  profile_t *pro, *res = NULL;
+  htsmsg_field_t *f;
+  const char *uuid, *uuid2;
+
+  pro = profile_find_by_uuid(name);
+  if (!pro)
+    pro  = profile_find_by_name(name, alt);
+  uuid = pro ? idnode_uuid_as_str(&pro->pro_id) : "";
+  if (uuids) {
+    HTSMSG_FOREACH(f, uuids) {
+      uuid2 = htsmsg_field_get_str(f) ?: "";
+      if (strcmp(uuid, uuid2) == 0)
+        return pro;
+      if (!res) {
+        res = profile_find_by_uuid(uuid2);
+        if (!res->pro_enabled)
+          res = NULL;
+      }
+    }
+  } else {
+    res = pro;
+  }
+  if (!res)
+    res = profile_find_by_name(NULL, NULL);
+  return res;
 }
 
 /*
@@ -377,12 +440,41 @@ profile_chain_close(profile_chain_t *prch)
   if (prch->prch_gh)
     globalheaders_destroy(prch->prch_gh);
 #if ENABLE_LIBAV
-  if (prch->prch_transcoder != NULL)
+  if (prch->prch_transcoder)
     transcoder_destroy(prch->prch_transcoder);
 #endif
   if (prch->prch_muxer)
     muxer_destroy(prch->prch_muxer);
   streaming_queue_deinit(&prch->prch_sq);
+}
+
+/*
+ *  HTSP Profile Class
+ */
+const idclass_t profile_htsp_class =
+{
+  .ic_super      = &profile_class,
+  .ic_class      = "profile-htsp",
+  .ic_caption    = "HTSP Stream Profile",
+  .ic_properties = (const property_t[]){
+    /* Ready for future extensions */
+    { }
+  }
+};
+
+static muxer_container_type_t
+profile_htsp_get_mc(profile_t *_pro)
+{
+  return MC_UNKNOWN;
+}
+
+static profile_t *
+profile_htsp_builder(void)
+{
+  profile_t *pro = calloc(1, sizeof(*pro));
+  pro->pro_open   = NULL;
+  pro->pro_get_mc = profile_htsp_get_mc;
+  return pro;
 }
 
 /*
@@ -396,7 +488,7 @@ typedef struct profile_mpegts {
 
 const idclass_t profile_mpegts_pass_class =
 {
-  .ic_super     = &profile_class,
+  .ic_super      = &profile_class,
   .ic_class      = "profile-mpegts",
   .ic_caption    = "MPEG-TS Pass-through",
   .ic_properties = (const property_t[]){
@@ -467,7 +559,7 @@ typedef struct profile_matroska {
 
 const idclass_t profile_matroska_class =
 {
-  .ic_super     = &profile_class,
+  .ic_super      = &profile_class,
   .ic_class      = "profile-matroska",
   .ic_caption    = "Matroska (mkv)",
   .ic_properties = (const property_t[]){
@@ -549,10 +641,11 @@ profile_class_mc_list ( void *o )
 {
   static const struct strtab tab[] = {
     { "Not set",                       MC_UNKNOWN },
-    { "Matroska (mkv)",                MC_MATROSKA, },
-    { "WEBM",                          MC_WEBM, },
-    { "MPEG-TS",                       MC_MPEGTS },
-    { "MPEG-PS (DVD)",                 MC_MPEGPS },
+    { "Matroska (mkv) /built-in",      MC_MATROSKA, },
+    { "WEBM /built-in",                MC_WEBM, },
+    { "MPEG-TS /av-lib",               MC_MPEGTS },
+    { "MPEG-PS (DVD) /av-lib",         MC_MPEGPS },
+    { "Matroska (mkv) /av-lib",        MC_AVMATROSKA },
   };
   return strtab2htsmsg(tab);
 }
@@ -689,7 +782,7 @@ profile_class_scodec_list(void *o)
 
 const idclass_t profile_transcode_class =
 {
-  .ic_super     = &profile_class,
+  .ic_super      = &profile_class,
   .ic_class      = "profile-transcode",
   .ic_caption    = "Transcode",
   .ic_properties = (const property_t[]){
@@ -792,6 +885,7 @@ profile_transcode_mc_valid(int mc)
   case MC_WEBM:
   case MC_MPEGTS:
   case MC_MPEGPS:
+  case MC_AVMATROSKA:
     return 1;
   default:
     return 0;
@@ -862,12 +956,15 @@ profile_init(void)
 {
   htsmsg_t *c, *e;
   htsmsg_field_t *f;
+  profile_t *pro;
+  const char *name;
 
   LIST_INIT(&profile_builders);
   TAILQ_INIT(&profiles);
 
   profile_register(&profile_mpegts_pass_class, profile_mpegts_pass_builder);
   profile_register(&profile_matroska_class, profile_matroska_builder);
+  profile_register(&profile_htsp_class, profile_htsp_builder);
 #if ENABLE_LIBAV
   profile_transcode_experimental_codecs =
     getenv("TVHEADEND_LIBAV_NO_EXPERIMENTAL_CODECS") ? 0 : 1;
@@ -883,37 +980,58 @@ profile_init(void)
     htsmsg_destroy(c);
   }
 
-  if (TAILQ_EMPTY(&profiles)) {
+  name = "pass";
+  pro = profile_find_by_name(name, NULL);
+  if (pro == NULL || strcmp(pro->pro_name, name)) {
     htsmsg_t *conf;
 
     conf = htsmsg_create_map();
     htsmsg_add_str (conf, "class", "profile-mpegts");
     htsmsg_add_bool(conf, "enabled", 1);
     htsmsg_add_bool(conf, "default", 1);
-    htsmsg_add_str (conf, "name", "pass");
+    htsmsg_add_str (conf, "name", name);
     htsmsg_add_str (conf, "comment", "MPEG-TS Pass-through");
     htsmsg_add_bool(conf, "rewrite_pmt", 1);
     htsmsg_add_bool(conf, "rewrite_pat", 1);
     htsmsg_add_bool(conf, "shield", 1);
     (void)profile_create(NULL, conf, 1);
     htsmsg_destroy(conf);
+  }
+
+  name = "matroska";
+  pro = profile_find_by_name(name, NULL);
+  if (pro == NULL || strcmp(pro->pro_name, name)) {
+    htsmsg_t *conf;
 
     conf = htsmsg_create_map();
     htsmsg_add_str (conf, "class", "profile-matroska");
     htsmsg_add_bool(conf, "enabled", 1);
-    htsmsg_add_str (conf, "name", "matroska");
+    htsmsg_add_str (conf, "name", name);
     htsmsg_add_str (conf, "comment", "Matroska");
     htsmsg_add_bool(conf, "shield", 1);
     (void)profile_create(NULL, conf, 1);
     htsmsg_destroy(conf);
   }
 
+  name = "htsp";
+  pro = profile_find_by_name(name, NULL);
+  if (pro == NULL || strcmp(pro->pro_name, name)) {
+    htsmsg_t *conf;
+
+    conf = htsmsg_create_map();
+    htsmsg_add_str (conf, "class", "profile-htsp");
+    htsmsg_add_bool(conf, "enabled", 1);
+    htsmsg_add_str (conf, "name", name);
+    htsmsg_add_str (conf, "comment", "HTSP Default Stream Settings");
+    htsmsg_add_bool(conf, "shield", 1);
+    (void)profile_create(NULL, conf, 1);
+    htsmsg_destroy(conf);
+  }
+
 #if ENABLE_LIBAV
-  profile_t *pro;
-  const char *name;
 
   name = "webtv-vp8-vorbis-webm";
-  pro = profile_find_by_name(name);
+  pro = profile_find_by_name(name, NULL);
   if (pro == NULL || strcmp(pro->pro_name, name)) {
     htsmsg_t *conf;
 
@@ -932,7 +1050,7 @@ profile_init(void)
     htsmsg_destroy(conf);
   }
   name = "webtv-h264-aac-mpegts";
-  pro = profile_find_by_name(name);
+  pro = profile_find_by_name(name, NULL);
   if (pro == NULL || strcmp(pro->pro_name, name)) {
     htsmsg_t *conf;
 
@@ -951,7 +1069,7 @@ profile_init(void)
     htsmsg_destroy(conf);
   }
   name = "webtv-h264-aac-matroska";
-  pro = profile_find_by_name(name);
+  pro = profile_find_by_name(name, NULL);
   if (pro == NULL || strcmp(pro->pro_name, name)) {
     htsmsg_t *conf;
 

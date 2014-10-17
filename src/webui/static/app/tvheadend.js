@@ -1,8 +1,6 @@
 tvheadend.dynamic = true;
 tvheadend.accessupdate = null;
-tvheadend.capabilties = null;
-tvheadend.dvrpanel = null;
-tvheadend.confpanel = null;
+tvheadend.capabilities = null;
 
 /* State Provider */
 Ext.state.Manager.setProvider(new Ext.state.CookieProvider({
@@ -158,9 +156,7 @@ Ext.Ajax.request({
 tvheadend.VideoPlayer = function(url) {
 
     var videoPlayer = new tv.ui.VideoPlayer({
-        params: {
-            resolution: 384
-        }
+        params: { }
     });
 
     var selectChannel = new Ext.form.ComboBox({
@@ -188,35 +184,32 @@ tvheadend.VideoPlayer = function(url) {
     });
 
     var sliderLabel = new Ext.form.Label();
-    sliderLabel.setText("90%");
+    sliderLabel.setText('90%');
     slider.addListener('change', function() {
         videoPlayer.setVolume(slider.getValue());
         sliderLabel.setText(videoPlayer.getVolume() + '%');
     });
 
-    var selectResolution = new Ext.form.ComboBox({
+    if (!tvheadend.profiles) {
+        tvheadend.profiles = tvheadend.idnode_get_enum({
+            url: 'api/profile/list',
+            event: 'profile',
+        });
+    }
+
+    var selectProfile = new Ext.form.ComboBox({
+        loadingText: 'Loading...',
         width: 150,
-        displayField: 'name',
-        valueField: 'res',
-        value: 384,
+        displayField: 'val',
         mode: 'local',
         editable: false,
         triggerAction: 'all',
-        emptyText: 'Select resolution...',
-        store: new Ext.data.SimpleStore({
-            fields: ['res', 'name'],
-            id: 0,
-            data: [
-                ['288', '288p'],
-                ['384', '384p'],
-                ['480', '480p'],
-                ['576', '576p']
-            ]
-        })
+        emptyText: 'Select profile...',
+        store: tvheadend.profiles,
     });
 
-    selectResolution.on('select', function(c, r) {
-        videoPlayer.setResolution(r.data.res);
+    selectProfile.on('select', function(c, r) {
+        videoPlayer.setProfile(r.data.val);
         if (videoPlayer.isIdle())
             return;
 
@@ -279,7 +272,7 @@ tvheadend.VideoPlayer = function(url) {
                 }
             },
             '-',
-            selectResolution,
+            selectProfile,
             '-',
             {
                 iconCls: 'control_volume',
@@ -353,9 +346,7 @@ function accessUpdate(o) {
 
         var idx = 0;
 
-        if (tvheadend.capabilities.indexOf('linuxdvb')     !== -1 ||
-            tvheadend.capabilities.indexOf('satip_client') !== -1 ||
-            tvheadend.capabilities.indexOf('v4l')          !== -1)
+        if (tvheadend.capabilities.indexOf('tvadapters') !== -1)
             tvheadend.tvadapters(dvbin);
         tvheadend.networks(dvbin);
         tvheadend.muxes(dvbin);

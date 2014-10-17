@@ -44,6 +44,7 @@
 #include "lang_codes.h"
 #include "descrambler.h"
 #include "input.h"
+#include "access.h"
 #include "esfilter.h"
 
 static void service_data_timeout(void *aux);
@@ -169,6 +170,7 @@ const idclass_t service_class = {
   .ic_class      = "service",
   .ic_caption    = "Service",
   .ic_event      = "service",
+  .ic_perm_def   = ACCESS_ADMIN,
   .ic_save       = service_class_save,
   .ic_get_title  = service_class_get_title,
   .ic_properties = (const property_t[]){
@@ -592,10 +594,10 @@ ignore:
  *
  */
 int
-service_start(service_t *t, int instance, int postpone)
+service_start(service_t *t, int instance, int timeout, int postpone)
 {
   elementary_stream_t *st;
-  int r, timeout = 10;
+  int r, stimeout = 10;
 
   lock_assert(&global_lock);
 
@@ -631,11 +633,13 @@ service_start(service_t *t, int instance, int postpone)
   pthread_mutex_unlock(&t->s_stream_mutex);
 
   if(t->s_grace_period != NULL)
-    timeout = t->s_grace_period(t);
+    stimeout = t->s_grace_period(t);
 
-  timeout += postpone;
-  t->s_grace_delay = timeout;
-  gtimer_arm(&t->s_receive_timer, service_data_timeout, t, timeout);
+  stimeout += postpone;
+  t->s_timeout = timeout;
+  t->s_grace_delay = stimeout;
+  if (stimeout > 0)
+    gtimer_arm(&t->s_receive_timer, service_data_timeout, t, stimeout);
   return 0;
 }
 
@@ -646,7 +650,7 @@ service_start(service_t *t, int instance, int postpone)
 service_instance_t *
 service_find_instance
   (service_t *s, channel_t *ch, service_instance_list_t *sil,
-   int *error, int weight, int flags, int postpone)
+   int *error, int weight, int flags, int timeout, int postpone)
 {
   channel_service_mapping_t *csm;
   service_instance_t *si, *next;
@@ -723,7 +727,7 @@ service_find_instance
 
   /* Start */
   tvhtrace("service", "will start new instance %d", si->si_instance);
-  if (service_start(si->si_s, si->si_instance, postpone)) {
+  if (service_start(si->si_s, si->si_instance, timeout, postpone)) {
     tvhtrace("service", "tuning failed");
     si->si_error = SM_CODE_TUNING_FAILED;
     if (*error < SM_CODE_TUNING_FAILED)
@@ -1020,7 +1024,8 @@ service_data_timeout(void *aux)
 
   pthread_mutex_unlock(&t->s_stream_mutex);
 
-  gtimer_arm(&t->s_receive_timer, service_data_timeout, t, 5);
+  if (t->s_timeout > 0)
+    gtimer_arm(&t->s_receive_timer, service_data_timeout, t, t->s_timeout);
 }
 
 /**
@@ -1485,7 +1490,6 @@ service_instance_add(service_instance_list_t *sil,
   return si;
 }
 
-
 /**
  *
  */
@@ -1497,7 +1501,6 @@ service_instance_destroy
   service_unref(si->si_s);
   free(si);
 }
-
 
 /**
  *

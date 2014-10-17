@@ -48,7 +48,7 @@ udp_resolve( udp_connection_t *uc, int receiver )
   snprintf(port_buf, 6, "%d", uc->port);
 
   memset(&hints, 0, sizeof(struct addrinfo));
-  hints.ai_flags = receiver ? AI_PASSIVE : 0;
+  hints.ai_flags = (receiver ? AI_PASSIVE : 0) | AI_NUMERICSERV;
   hints.ai_family = AF_UNSPEC;
   hints.ai_socktype = SOCK_DGRAM;
   
@@ -181,7 +181,12 @@ udp_bind ( const char *subsystem, const char *name,
   }
 
   /* Mark reuse address */
-  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+  if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse))) {
+    tvherror(subsystem, "%s - failed to reuse address for socket [%s]",
+             name, strerror(errno));
+    udp_close(uc);
+    return UDP_FATAL_ERROR;
+  }
 
   /* Bind to interface */
   ifindex = udp_ifindex_required(uc) ? udp_get_ifindex(ifname) : 0;
@@ -260,7 +265,11 @@ udp_bind ( const char *subsystem, const char *name,
   }
 
   addrlen = sizeof(uc->ip);
-  getsockname(fd, (struct sockaddr *)&uc->ip, &addrlen);
+  if (getsockname(fd, (struct sockaddr *)&uc->ip, &addrlen)) {
+    tvherror(subsystem, "%s - cannot obtain socket name [%s]",
+             name, strerror(errno));
+    goto error;
+  }
     
   /* Increase RX buffer size */
   if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rxsize, sizeof(rxsize)) == -1)

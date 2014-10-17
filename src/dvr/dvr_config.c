@@ -52,7 +52,7 @@ dvr_config_find_by_name(const char *name)
     name = "";
 
   LIST_FOREACH(cfg, &dvrconfigs, config_link)
-    if (!strcmp(name, cfg->dvr_config_name))
+    if (cfg->dvr_enabled && !strcmp(name, cfg->dvr_config_name))
       return cfg;
 
   return NULL;
@@ -91,6 +91,41 @@ dvr_config_find_by_name_default(const char *name)
   }
 
   return cfg;
+}
+
+/*
+ * find a dvr config by name using a filter list,
+ * return the first config from list if name is not valid
+ * return the default config if not found
+ */
+dvr_config_t *
+dvr_config_find_by_list(htsmsg_t *uuids, const char *name)
+{
+  dvr_config_t *cfg, *res = NULL;
+  htsmsg_field_t *f;
+  const char *uuid, *uuid2;
+
+  cfg  = dvr_config_find_by_uuid(name);
+  if (!cfg)
+    cfg  = dvr_config_find_by_name(name);
+  uuid = cfg ? idnode_uuid_as_str(&cfg->dvr_id) : "";
+  if (uuids) {
+    HTSMSG_FOREACH(f, uuids) {
+      uuid2 = htsmsg_field_get_str(f) ?: "";
+      if (strcmp(uuid, uuid2) == 0)
+        return cfg;
+      if (!res) {
+        res = dvr_config_find_by_uuid(uuid2);
+        if (!res->dvr_enabled)
+          res = NULL;
+      }
+    }
+  } else {
+    res = cfg;
+  }
+  if (!res)
+    res = dvr_config_find_by_name_default(NULL);
+  return res;
 }
 
 /**
@@ -171,7 +206,7 @@ dvr_config_create(const char *name, const char *uuid, htsmsg_t *conf)
   tvhinfo("dvr", "Creating new configuration '%s'", cfg->dvr_config_name);
 
   if (cfg->dvr_profile == NULL) {
-    cfg->dvr_profile = profile_find_by_name(NULL);
+    cfg->dvr_profile = profile_find_by_name("dvr", NULL);
     assert(cfg->dvr_profile);
     LIST_INSERT_HEAD(&cfg->dvr_profile->pro_dvr_configs, cfg, profile_link);
   }
@@ -343,7 +378,7 @@ dvr_config_class_profile_set(void *o, const void *v)
   profile_t *pro;
 
   pro = v ? profile_find_by_uuid(v) : NULL;
-  pro = pro ?: profile_find_by_name(v);
+  pro = pro ?: profile_find_by_name(v, "dvr");
   if (pro == NULL) {
     if (cfg->dvr_profile) {
       LIST_REMOVE(cfg, profile_link);
@@ -497,7 +532,6 @@ const idclass_t dvr_config_class = {
       .type     = PT_STR,
       .id       = "profile",
       .name     = "Stream Profile",
-      .off      = offsetof(dvr_config_t, dvr_profile),
       .set      = dvr_config_class_profile_set,
       .get      = dvr_config_class_profile_get,
       .rend     = dvr_config_class_profile_rend,
@@ -707,7 +741,7 @@ dvr_config_destroy_by_profile(profile_t *pro, int delconf)
 
   while((cfg = LIST_FIRST(&pro->pro_dvr_configs)) != NULL) {
     LIST_REMOVE(cfg, profile_link);
-    cfg->dvr_profile = profile_find_by_name(NULL);
+    cfg->dvr_profile = profile_find_by_name(NULL, "dvr");
   }
 }
 

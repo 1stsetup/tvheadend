@@ -651,7 +651,7 @@ htsp_build_tag(channel_tag_t *ct, const char *method, int include_channels)
   htsmsg_add_u32(out, "tagId", htsp_channel_tag_get_identifier(ct));
 
   htsmsg_add_str(out, "tagName", ct->ct_name);
-  htsmsg_add_str(out, "tagIcon", ct->ct_icon);
+  htsmsg_add_str(out, "tagIcon", channel_tag_get_icon(ct));
   htsmsg_add_u32(out, "tagTitledIcon", ct->ct_titled_icon);
 
   if(members != NULL) {
@@ -1783,22 +1783,25 @@ htsp_method_subscribe(htsp_connection_t *htsp, htsmsg_t *in)
   }
 #endif
 
-#if ENABLE_LIBAV
+  profile_t *pro;
   const char *profile_id = htsmsg_get_str(in, "profile");
-  profile_t *pro = profile_find_by_uuid(profile_id) ?: profile_find_by_name(profile_id);
+  if (profile_id) {
+    pro = profile_find_by_uuid(profile_id);
+    if (pro)
+      profile_id = pro->pro_name;
+  }
+  pro = profile_find_by_list(htsp->htsp_granted_access->aa_profiles, profile_id, "htsp");
 
   hs->hs_work = profile_work(pro, st, &hs->hs_work_destroy);
   if (hs->hs_work) {
     st = hs->hs_work;
     normts = 1;
   }
-#endif
-
   if(normts)
     st = hs->hs_tsfix = tsfix_create(st);
 
   tvhdebug("htsp", "%s - subscribe to %s\n", htsp->htsp_logname, ch->ch_name ?: "");
-  hs->hs_s = subscription_create_from_channel(ch, weight,
+  hs->hs_s = subscription_create_from_channel(ch, pro, weight,
 					      htsp->htsp_logname,
 					      st,
 					      SUBSCRIPTION_STREAMING,

@@ -21,6 +21,8 @@
 #include "queue.h"
 #include "input.h"
 #include "subscriptions.h"
+#include "channels.h"
+#include "access.h"
 #include "dvb_charset.h"
 
 #include <assert.h>
@@ -37,6 +39,7 @@ const idclass_t mpegts_mux_instance_class =
 {
   .ic_class      = "mpegts_mux_instance",
   .ic_caption    = "MPEGTS Multiplex Phy",
+  .ic_perm_def   = ACCESS_ADMIN
 };
 
 static void
@@ -200,6 +203,22 @@ mpegts_mux_class_get_num_svc ( void *ptr )
 }
 
 static const void *
+mpegts_mux_class_get_num_chn ( void *ptr )
+{
+  static int n;
+  mpegts_mux_t *mm = ptr;
+  mpegts_service_t *s;
+  channel_service_mapping_t *csm;
+
+  n = 0;
+  LIST_FOREACH(s, &mm->mm_services, s_dvb_mux_link)
+    LIST_FOREACH(csm, &s->s_channels, csm_svc_link)
+      n++;
+
+  return &n;
+}
+
+static const void *
 mpegts_mux_class_get_network ( void *ptr )
 {
   static char buf[512], *s = buf;
@@ -319,6 +338,7 @@ const idclass_t mpegts_mux_class =
   .ic_class      = "mpegts_mux",
   .ic_caption    = "MPEGTS Multiplex",
   .ic_event      = "mpegts_mux",
+  .ic_perm_def   = ACCESS_ADMIN,
   .ic_save       = mpegts_mux_class_save,
   .ic_delete     = mpegts_mux_class_delete,
   .ic_get_title  = mpegts_mux_class_get_title,
@@ -405,6 +425,13 @@ const idclass_t mpegts_mux_class =
       .name     = "# Services",
       .opts     = PO_RDONLY | PO_NOSAVE,
       .get      = mpegts_mux_class_get_num_svc,
+    },
+    {
+      .type     = PT_INT,
+      .id       = "num_chn",
+      .name     = "# Channels",
+      .opts     = PO_RDONLY | PO_NOSAVE,
+      .get      = mpegts_mux_class_get_num_chn,
     },
     {
       .type     = PT_BOOL,
@@ -1048,7 +1075,7 @@ mpegts_mux_subscribe
 {
   int err = 0;
   th_subscription_t *s;
-  s = subscription_create_from_mux(mm, weight, name, NULL,
+  s = subscription_create_from_mux(mm, NULL, weight, name, NULL,
                                    SUBSCRIPTION_NONE,
                                    NULL, NULL, NULL, &err);
   return s ? 0 : err;
