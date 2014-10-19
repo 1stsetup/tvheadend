@@ -114,6 +114,8 @@ lav_muxer_add_stream(lav_muxer_t *lm,
 #if 0
     c->time_base.num = 1;
     c->time_base.den = c->sample_rate;
+#else
+    c->time_base     = st->time_base;
 #endif
 
     av_dict_set(&st->metadata, "language", ssc->ssc_lang, 0);
@@ -123,10 +125,8 @@ lav_muxer_add_stream(lav_muxer_t *lm,
     c->width      = ssc->ssc_width;
     c->height     = ssc->ssc_height;
 
-#if 0
-    c->time_base.num  = 1;
+    c->time_base.num = 1;
     c->time_base.den = 25;
-#endif
 
     c->sample_aspect_ratio.num = ssc->ssc_aspect_num;
     c->sample_aspect_ratio.den = ssc->ssc_aspect_den;
@@ -161,6 +161,12 @@ lav_muxer_support_stream(muxer_container_type_t mc,
     ret |= SCT_ISAUDIO(type);
     ret |= SCT_ISVIDEO(type);
     ret |= SCT_ISSUBTITLE(type);
+    break;
+
+  case MC_WEBM:
+  case MC_AVWEBM:
+    ret |= type == SCT_VP8;
+    ret |= type == SCT_VORBIS;
     break;
 
   case MC_MPEGTS:
@@ -381,9 +387,6 @@ lav_muxer_write_pkt(muxer_t *m, streaming_message_type_t smt, void *data)
 
     av_init_packet(&packet);
 
-    if(st->codec->codec_id == AV_CODEC_ID_MPEG2VIDEO)
-      pkt = pkt_merge_header(pkt);
-
     if(lm->lm_h264_filter && st->codec->codec_id == AV_CODEC_ID_H264) {
       if(av_bitstream_filter_filter(lm->lm_h264_filter,
 				    st->codec, 
@@ -396,6 +399,10 @@ lav_muxer_write_pkt(muxer_t *m, streaming_message_type_t smt, void *data)
 	tvhlog(LOG_WARNING, "libav",  "Failed to filter bitstream");
 	break;
       }
+    } else if (st->codec->codec_id == AV_CODEC_ID_AAC) {
+      /* remove ADTS header */
+      packet.data = pktbuf_ptr(pkt->pkt_payload) + 7;
+      packet.size = pktbuf_len(pkt->pkt_payload) - 7;
     } else {
       packet.data = pktbuf_ptr(pkt->pkt_payload);
       packet.size = pktbuf_len(pkt->pkt_payload);
@@ -512,6 +519,10 @@ lav_muxer_create(const muxer_config_t *m_cfg)
   case MC_MATROSKA:
   case MC_AVMATROSKA:
     mux_name = "matroska";
+    break;
+  case MC_WEBM:
+  case MC_AVWEBM:
+    mux_name = "webm";
     break;
   default:
     mux_name = muxer_container_type2txt(m_cfg->m_type);

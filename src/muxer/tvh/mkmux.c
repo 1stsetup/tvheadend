@@ -47,7 +47,6 @@ TAILQ_HEAD(mk_chapter_queue, mk_chapter);
 typedef struct mk_track {
   int index;
   int enabled;
-  int merge;
   int type;
   int tracknum;
   int disabled;
@@ -236,6 +235,7 @@ mk_build_tracks(mk_mux_t *mkm, const streaming_start_t *ss)
   htsbuf_queue_t *q = htsbuf_queue_alloc(0), *t;
   int tracknum = 0;
   uint8_t buf4[4];
+  uint32_t bit_depth = 0;
 
   mkm->tracks = calloc(1, sizeof(mk_track_t) * ss->ss_num_components);
   mkm->ntracks = ss->ss_num_components;
@@ -257,11 +257,14 @@ mk_build_tracks(mk_mux_t *mkm, const streaming_start_t *ss)
     mkm->tracks[i].sri = ssc->ssc_sri;
     mkm->tracks[i].nextpts = PTS_UNSET;
 
+    if (mkm->webm && ssc->ssc_type != SCT_VP8 && ssc->ssc_type != SCT_VORBIS)
+      tvhwarn("mkv", "WEBM format supports only VP8+VORBIS streams (detected %s)",
+              streaming_component_type2txt(ssc->ssc_type));
+
     switch(ssc->ssc_type) {
     case SCT_MPEG2VIDEO:
       tracktype = 1;
       codec_id = "V_MPEG2";
-      mkm->tracks[i].merge = 1;
       break;
 
     case SCT_H264:
@@ -302,6 +305,7 @@ mk_build_tracks(mk_mux_t *mkm, const streaming_start_t *ss)
     case SCT_AAC:
       tracktype = 2;
       codec_id = "A_AAC";
+      bit_depth = 16;
       break;
 
     case SCT_VORBIS:
@@ -385,15 +389,13 @@ mk_build_tracks(mk_mux_t *mkm, const streaming_start_t *ss)
       break;
     }
 
-    if(ssc->ssc_frameduration) {
-      int d = ts_rescale(ssc->ssc_frameduration, 1000000000);
-      ebml_append_uint(t, 0x23e383, d);
-    }
-    
-
     if(SCT_ISVIDEO(ssc->ssc_type)) {
       htsbuf_queue_t *vi = htsbuf_queue_alloc(0);
 
+      if(ssc->ssc_frameduration) {
+        int d = ts_rescale(ssc->ssc_frameduration, 1000000000);
+        ebml_append_uint(t, 0x23e383, d);
+      }
       ebml_append_uint(vi, 0xb0, ssc->ssc_width);
       ebml_append_uint(vi, 0xba, ssc->ssc_height);
 
@@ -416,6 +418,8 @@ mk_build_tracks(mk_mux_t *mkm, const streaming_start_t *ss)
 
       ebml_append_float(au, 0xb5, sri_to_rate(ssc->ssc_sri));
       ebml_append_uint(au, 0x9f, ssc->ssc_channels);
+      if (bit_depth)
+        ebml_append_uint(au, 0x6264, bit_depth);
 
       ebml_append_master(t, 0xe1, au);
     }
@@ -979,7 +983,6 @@ mk_write_frame_i(mk_mux_t *mkm, mk_track_t *t, th_pkt_t *pkt)
     data += 7;
   }
 
-
   ebml_append_id(mkm->cluster, 0xa3 ); // SimpleBlock
   ebml_append_size(mkm->cluster, len + 4);
   ebml_append_size(mkm->cluster, t->tracknum);
@@ -1177,9 +1180,6 @@ mk_mux_write_pkt(mk_mux_t *mkm, th_pkt_t *pkt)
 
   if(mark)
     mk_mux_insert_chapter(mkm);
-
-  if(t->merge)
-    pkt = pkt_merge_header(pkt);
 
   mk_write_frame_i(mkm, t, pkt);
 

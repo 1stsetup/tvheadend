@@ -37,6 +37,7 @@
 #include "packet.h"
 #include "transcoding.h"
 #include "libav.h"
+#include "parsers/bitstream.h"
 
 static long transcoder_nrprocessors;
 
@@ -200,6 +201,10 @@ transcoder_get_decoder(transcoder_t *t, streaming_component_type_t ty)
   enum AVCodecID codec_id;
   AVCodec *codec;
 
+  /* the MP4A and AAC packet format is same, reduce to one type */
+  if (ty == SCT_MP4A)
+    ty = SCT_AAC;
+
   codec_id = streaming_component_type2codec_id(ty);
   if (codec_id == AV_CODEC_ID_NONE) {
     tvherror("transcode", "%04X: Unsupported input codec %s",
@@ -313,6 +318,31 @@ transcoder_stream_subtitle(transcoder_t *t, transcoder_stream_t *ts, th_pkt_t *p
   avsubtitle_free(&sub);
 }
 
+static void
+create_adts_header(pktbuf_t *pb, int sri, int channels)
+{
+   bitstream_t bs;
+
+   /* 7 bytes of ADTS header */
+   init_wbits(&bs, pktbuf_ptr(pb), 56);
+
+   put_bits(&bs, 0xfff, 12); // Sync marker
+   put_bits(&bs, 0, 1);      // ID 0 = MPEG 4
+   put_bits(&bs, 0, 2);      // Layer
+   put_bits(&bs, 1, 1);      // Protection absent
+   put_bits(&bs, 2, 2);      // AOT
+   put_bits(&bs, sri, 4);
+   put_bits(&bs, 1, 1);      // Private bit
+   put_bits(&bs, channels, 3);
+   put_bits(&bs, 1, 1);      // Original
+   put_bits(&bs, 1, 1);      // Copy
+
+   put_bits(&bs, 1, 1);      // Copyright identification bit
+   put_bits(&bs, 1, 1);      // Copyright identification start
+   put_bits(&bs, pktbuf_len(pb), 13);
+   put_bits(&bs, 0, 11);     // Buffer fullness
+   put_bits(&bs, 0, 2);      // RDB in frame
+}
 
 /**
  *
@@ -355,8 +385,6 @@ transcoder_stream_audio(transcoder_t *t, transcoder_stream_t *ts, th_pkt_t *pkt)
     as->aud_enc_pts += (pkt->pkt_pts - as->aud_dec_pts);
     as->aud_dec_pts += (pkt->pkt_pts - as->aud_dec_pts);
   }
-
-  pkt = pkt_merge_header(pkt);
 
   av_init_packet(&packet);
   packet.data     = pktbuf_ptr(pkt->pkt_payload);
@@ -690,22 +718,33 @@ transcoder_stream_audio(transcoder_t *t, transcoder_stream_t *ts, th_pkt_t *pkt)
 
     } else if (got_packet_ptr && packet.pts >= 0) {
 
-      n = pkt_alloc(packet.data, packet.size, packet.pts, packet.pts);
+      int extra_size = 0;
+      
+      if (ts->ts_type == SCT_AAC) {
+        /* only if ADTS header is missing, create it */
+        if (packet.size < 2 || packet.data[0] != 0xff || (packet.data[1] & 0xf0) != 0xf0)
+          extra_size = 7;
+      }
+      
+      n = pkt_alloc(NULL, packet.size + extra_size, packet.pts, packet.pts);
+      memcpy(pktbuf_ptr(n->pkt_payload) + extra_size, packet.data, packet.size);
+
       n->pkt_componentindex = ts->ts_index;
       n->pkt_channels       = octx->channels;
       n->pkt_sri            = rate_to_sri(octx->sample_rate);
+      n->pkt_duration       = packet.duration;
 
-      n->pkt_duration = packet.duration;
+      if (extra_size && ts->ts_type == SCT_AAC)
+        create_adts_header(pkt->pkt_payload, n->pkt_sri, octx->channels);
 
       if (octx->extradata_size)
-	n->pkt_header = pktbuf_alloc(octx->extradata, octx->extradata_size);
+	n->pkt_meta = pktbuf_alloc(octx->extradata, octx->extradata_size);
 
       tvhtrace("transcode", "%04X: deliver audio (pts = %" PRIi64 ", delay = %i)",
                shortid(t), n->pkt_pts, octx->delay);
       sm = streaming_msg_create_pkt(n);
       streaming_target_deliver2(ts->ts_target, sm);
       pkt_ref_dec(n);
-
     }
 
     av_free_packet(&packet);
@@ -782,7 +821,7 @@ Minimal of 12 bytes.
      }
     }
 
-    n->pkt_header = pktbuf_alloc(data, header_size);
+    n->pkt_meta = pktbuf_alloc(data, header_size);
   }
 }
 
@@ -845,7 +884,7 @@ send_video_packet(transcoder_t *t, transcoder_stream_t *ts, th_pkt_t *pkt,
   }
 
   if (octx->extradata_size)
-    n->pkt_header = pktbuf_alloc(octx->extradata, octx->extradata_size);
+    n->pkt_meta = pktbuf_alloc(octx->extradata, octx->extradata_size);
   else {
     if (octx->codec_id == AV_CODEC_ID_MPEG2VIDEO)
       extract_mpeg2_global_data(n, epkt->data, epkt->size);
@@ -891,8 +930,6 @@ transcoder_stream_video(transcoder_t *t, transcoder_stream_t *ts, th_pkt_t *pkt)
       goto cleanup;
     }
   }
-
-  pkt = pkt_merge_header(pkt);
 
   av_init_packet(&packet);
   packet.data     = pktbuf_ptr(pkt->pkt_payload);
@@ -1540,22 +1577,7 @@ transcoder_start(transcoder_t *t, streaming_start_t *src)
     if (ssc_src->ssc_disabled)
       continue;
 
-    ssc->ssc_index          = ssc_src->ssc_index;
-    ssc->ssc_type           = ssc_src->ssc_type;
-    ssc->ssc_composition_id = ssc_src->ssc_composition_id;
-    ssc->ssc_ancillary_id   = ssc_src->ssc_ancillary_id;
-    ssc->ssc_pid            = ssc_src->ssc_pid;
-    ssc->ssc_width          = ssc_src->ssc_width;
-    ssc->ssc_height         = ssc_src->ssc_height;
-    ssc->ssc_aspect_num     = ssc_src->ssc_aspect_num;
-    ssc->ssc_aspect_den     = ssc_src->ssc_aspect_den;
-    ssc->ssc_sri            = ssc_src->ssc_sri;
-    ssc->ssc_channels       = ssc_src->ssc_channels;
-    ssc->ssc_disabled       = ssc_src->ssc_disabled;
-    ssc->ssc_frameduration  = ssc_src->ssc_frameduration;
-    ssc->ssc_gh             = ssc_src->ssc_gh;
-
-    memcpy(ssc->ssc_lang, ssc_src->ssc_lang, 4);
+    *ssc = *ssc_src;
 
     if (SCT_ISVIDEO(ssc->ssc_type)) 
       rc = transcoder_init_video(t, ssc);
