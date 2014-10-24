@@ -167,6 +167,7 @@ void epggrab_module_ch_save ( void *_m, epggrab_channel_t *ch )
     htsmsg_add_u32(m, "number", ch->number);
 
   hts_settings_save(m, "epggrab/%s/channels/%s", mod->id, ch->id);
+  htsmsg_destroy(m);
 }
 
 void epggrab_module_ch_add ( void *m, channel_t *ch )
@@ -199,9 +200,9 @@ static void _epggrab_module_channel_load
   htsmsg_t *a;
   htsmsg_field_t *f;
   channel_t *ch;
-
-  epggrab_channel_t *egc
-    = epggrab_channel_find(mod->channels, id, 1, &save, mod);
+  epggrab_channel_t *egc;
+  
+  egc  = epggrab_channel_find(mod->channels, id, 1, &save, mod);
 
   if ((str = htsmsg_get_str(m, "name")))
     egc->name = strdup(str);

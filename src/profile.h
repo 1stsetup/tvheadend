@@ -47,7 +47,12 @@ typedef LIST_HEAD(, profile_build) profile_builders_queue;
 
 extern profile_builders_queue profile_builders;
 
+#define PRCH_FLAG_SKIPZEROING (1<<0)
+#define PRCH_FLAG_TSFIX       (1<<1)
+
 typedef struct profile_chain {
+  struct profile          *prch_pro;
+  void                    *prch_id;
   int                      prch_flags;
   struct streaming_queue   prch_sq;
   struct streaming_target *prch_st;
@@ -57,11 +62,16 @@ typedef struct profile_chain {
 #if ENABLE_LIBAV
   struct streaming_target *prch_transcoder;
 #endif
+#if ENABLE_TIMESHIFT
+  struct streaming_target *prch_timeshift;
+#endif
 } profile_chain_t;
 
 typedef struct profile {
   idnode_t pro_id;
   TAILQ_ENTRY(profile) pro_link;
+
+  int pro_refcount;
 
   LIST_HEAD(,dvr_config) pro_dvr_configs;
   LIST_HEAD(,access_entry) pro_accesses;
@@ -77,11 +87,10 @@ typedef struct profile {
   void (*pro_conf_changed)(struct profile *pro);
   muxer_container_type_t (*pro_get_mc)(struct profile *pro);
 
-  struct streaming_target *(*pro_work)(struct profile *pro,
-                                       struct streaming_target *src,
-                                       void (**destroy)(struct streaming_target *));
-  int  (*pro_open)(struct profile *pro, profile_chain_t *prch,
-                   muxer_config_t *m_cfg, int flags, size_t qsize);
+  int (*pro_work)(profile_chain_t *prch, struct streaming_target *dst,
+                  uint32_t timeshift_period, int flags);
+  int (*pro_open)(profile_chain_t *prch,
+                  muxer_config_t *m_cfg, int flags, size_t qsize);
 } profile_t;
 
 void profile_register(const idclass_t *clazz, profile_builder_t builder);
@@ -89,17 +98,24 @@ void profile_register(const idclass_t *clazz, profile_builder_t builder);
 profile_t *profile_create
   (const char *uuid, htsmsg_t *conf, int save);
 
-static inline struct streaming_target *
-profile_work(profile_t *pro, struct streaming_target *src,
-             void (**destroy)(struct streaming_target *st))
-  { return pro && pro->pro_work ? pro->pro_work(pro, src, destroy) : NULL; }
+static inline void profile_grab( profile_t *pro )
+  { pro->pro_refcount++; }
 
+void profile_release_( profile_t *pro );
+static inline void profile_release( profile_t *pro )
+  {
+    assert(pro->pro_refcount > 0);
+    if (--pro->pro_refcount == 0) profile_release_(pro);
+  }
 
-static inline int
-profile_chain_open(profile_t *pro, profile_chain_t *prch,
-                   muxer_config_t *m_cfg, int flags, size_t qsize)
-  { return pro->pro_open(pro, prch, m_cfg, flags, qsize); }
-int  profile_chain_raw_open(profile_chain_t *prch, size_t qsize);
+int
+profile_chain_work(profile_chain_t *prch, struct streaming_target *dst,
+                   uint32_t timeshift_period, int flags);
+int
+profile_chain_open(profile_chain_t *prch,
+                   muxer_config_t *m_cfg, int flags, size_t qsize);
+void profile_chain_init(profile_chain_t *prch, profile_t *pro, void *id);
+int  profile_chain_raw_open(profile_chain_t *prch, void *id, size_t qsize);
 void profile_chain_close(profile_chain_t *prch);
 
 static inline profile_t *profile_find_by_uuid(const char *uuid)
@@ -116,7 +132,7 @@ const char *profile_get_name(profile_t *pro);
 static inline muxer_container_type_t profile_get_mc(profile_t *pro)
   { return pro->pro_get_mc(pro); }
 
-void profile_get_htsp_list(htsmsg_t *array);
+void profile_get_htsp_list(htsmsg_t *array, htsmsg_t *filter);
 
 void profile_init(void);
 void profile_done(void);

@@ -21,6 +21,26 @@
 
 #include <assert.h>
 
+void
+mpegts_table_consistency_check ( mpegts_mux_t *mm )
+{
+#if ENABLE_TRACE
+  int i, c = 0;
+  mpegts_table_t *mt;
+
+  lock_assert(&mm->mm_tables_lock);
+
+  i = mm->mm_num_tables;
+  LIST_FOREACH(mt, &mm->mm_tables, mt_link)
+    c++;
+
+  if (i != c) {
+    tvherror("mpegts", "table: mux %p count inconsistency (num %d, list %d)", mm, i, c);
+    abort();
+  }
+#endif
+}
+
 static void
 mpegts_table_fastswitch ( mpegts_mux_t *mm )
 {
@@ -119,6 +139,9 @@ mpegts_table_release_ ( mpegts_table_t *mt )
     RB_REMOVE(&mt->mt_state, st, link);
     free(st);
   }
+  tvhtrace("mpegts", "table: mux %p free %s %02X/%02X (%d) pid %04X (%d)",
+           mt->mt_mux, mt->mt_name, mt->mt_table, mt->mt_mask, mt->mt_table,
+           mt->mt_pid, mt->mt_pid);
   if (mt->mt_destroy)
     mt->mt_destroy(mt);
   free(mt->mt_name);
@@ -131,8 +154,13 @@ mpegts_table_destroy ( mpegts_table_t *mt )
   mpegts_mux_t *mm = mt->mt_mux;
 
   pthread_mutex_lock(&mm->mm_tables_lock);
+  tvhtrace("mpegts", "table: mux %p destroy %s %02X/%02X (%d) pid %04X (%d)",
+           mm, mt->mt_name, mt->mt_table, mt->mt_mask, mt->mt_table,
+           mt->mt_pid, mt->mt_pid);
+  mpegts_table_consistency_check(mm);
   mt->mt_destroyed = 1;
   mt->mt_mux->mm_close_table(mt->mt_mux, mt);
+  mpegts_table_consistency_check(mm);
   pthread_mutex_unlock(&mm->mm_tables_lock);
   mpegts_table_release(mt);
 }
@@ -165,6 +193,7 @@ mpegts_table_add
 
   /* Check for existing */
   pthread_mutex_lock(&mm->mm_tables_lock);
+  mpegts_table_consistency_check(mm);
   LIST_FOREACH(mt, &mm->mm_tables, mt_link) {
     if (mt->mt_opaque != opaque)
       continue;
@@ -186,11 +215,12 @@ mpegts_table_add
       if (!(flags & MT_SKIPSUBS) && !mt->mt_subscribed)
         mm->mm_open_table(mm, mt, 1);
     }
+    mpegts_table_consistency_check(mm);
     pthread_mutex_unlock(&mm->mm_tables_lock);
     return mt;
   }
-  tvhtrace("mpegts", "add %s table %02X/%02X (%d) pid %04X (%d)",
-           name, tableid, mask, tableid, pid, pid);
+  tvhtrace("mpegts", "table: mux %p add %s %02X/%02X (%d) pid %04X (%d)",
+           mm, name, tableid, mask, tableid, pid, pid);
 
   /* Create */
   mt = calloc(1, sizeof(mpegts_table_t));
@@ -215,6 +245,7 @@ mpegts_table_add
       subscribe = 0;
   }
   mm->mm_open_table(mm, mt, subscribe);
+  mpegts_table_consistency_check(mm);
   pthread_mutex_unlock(&mm->mm_tables_lock);
   return mt;
 }
@@ -229,6 +260,7 @@ mpegts_table_flush_all ( mpegts_mux_t *mm )
 
   descrambler_flush_tables(mm);
   pthread_mutex_lock(&mm->mm_tables_lock);
+  mpegts_table_consistency_check(mm);
   while ((mt = TAILQ_FIRST(&mm->mm_defer_tables))) {
     TAILQ_REMOVE(&mm->mm_defer_tables, mt, mt_defer_link);
     mt->mt_defer_cmd = 0;
@@ -237,10 +269,17 @@ mpegts_table_flush_all ( mpegts_mux_t *mm )
   while ((mt = LIST_FIRST(&mm->mm_tables))) {
     mt->mt_flags &= ~MT_DEFER; /* force destroy */
     mt->mt_destroyed = 1;      /* early destroy mark */
+    mpegts_table_grab(mt);
+    mpegts_table_consistency_check(mm);
     pthread_mutex_unlock(&mm->mm_tables_lock);
     mpegts_table_destroy(mt);
+    mpegts_table_release(mt);
     pthread_mutex_lock(&mm->mm_tables_lock);
+    mpegts_table_consistency_check(mm);
   }
+  assert(mm->mm_num_tables == 0);
+  assert(TAILQ_FIRST(&mm->mm_defer_tables) == NULL);
+  assert(LIST_FIRST(&mm->mm_tables) == NULL);
   pthread_mutex_unlock(&mm->mm_tables_lock);
 }
 

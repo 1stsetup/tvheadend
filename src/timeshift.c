@@ -112,6 +112,37 @@ void timeshift_save ( void )
 }
 
 /*
+ * Decode initial time diff
+ *
+ * Gather some packets and select the lowest pts to identify
+ * the correct start. Note that for timeshift, the tsfix
+ * stream plugin is applied, so the starting pts should be
+ * near zero. If not - it's a bug.
+ */
+static void
+timeshift_set_pts_delta ( timeshift_t *ts, int64_t pts )
+{
+  int i;
+  int64_t smallest = INT64_MAX;
+
+  if (pts == PTS_UNSET)
+    return;
+
+  for (i = 0; i < ARRAY_SIZE(ts->pts_val); i++) {
+    int64_t i64 = ts->pts_val[i];
+    if (i64 == PTS_UNSET) {
+      ts->pts_val[i] = pts;
+      break;
+    }
+    if (i64 < smallest)
+      smallest = i64;
+  }
+
+  if (i >= ARRAY_SIZE(ts->pts_val))
+    ts->pts_delta = getmonoclock() - ts_rescale(smallest, 1000000);
+}
+
+/*
  * Receive data
  */
 static void timeshift_input
@@ -169,10 +200,8 @@ static void timeshift_input
       exit = 1;
 
     /* Record (one-off) PTS delta */
-    if (sm->sm_type == SMT_PACKET && ts->pts_delta == PTS_UNSET) {
-      if (pkt->pkt_pts != PTS_UNSET)
-        ts->pts_delta = getmonoclock() - ts_rescale(pkt->pkt_pts, 1000000);
-    }
+    if (sm->sm_type == SMT_PACKET && ts->pts_delta == PTS_UNSET)
+      timeshift_set_pts_delta(ts, pkt->pkt_pts);
 
     /* Buffer to disk */
     if ((ts->state > TS_LIVE) || (!ts->ondemand && (ts->state == TS_LIVE))) {
@@ -256,6 +285,7 @@ streaming_target_t *timeshift_create
   (streaming_target_t *out, time_t max_time)
 {
   timeshift_t *ts = calloc(1, sizeof(timeshift_t));
+  int i;
 
   /* Must hold global lock */
   lock_assert(&global_lock);
@@ -271,6 +301,8 @@ streaming_target_t *timeshift_create
   ts->id         = timeshift_index;
   ts->ondemand   = timeshift_ondemand;
   ts->pts_delta  = PTS_UNSET;
+  for (i = 0; i < ARRAY_SIZE(ts->pts_val); i++)
+    ts->pts_val[i] = PTS_UNSET;
   pthread_mutex_init(&ts->rdwr_mutex, NULL);
   pthread_mutex_init(&ts->state_mutex, NULL);
 

@@ -44,6 +44,8 @@ tvheadend.miscconf = function(panel, index) {
         'muxconfpath', 'language',
         'tvhtime_update_enabled', 'tvhtime_ntp_enabled',
         'tvhtime_tolerance',
+        'prefer_picon',
+        'chiconpath',
         'piconpath'
     ]);
 
@@ -131,9 +133,20 @@ tvheadend.miscconf = function(panel, index) {
     * Picons
     */
 
+    var preferPicon = new Ext.ux.form.XCheckbox({
+        name: 'prefer_picon',
+        fieldLabel: 'Prefer picons over channel name',
+    });
+
+    var chiconPath = new Ext.form.TextField({
+        name: 'chiconpath',
+        fieldLabel: 'Channel icon path<br/>(e.g. file:///tmp/icons/%C.png or http://...)',
+        width: 400
+    });
+
     var piconPath = new Ext.form.TextField({
         name: 'piconpath',
-        fieldLabel: 'Picon path (e.g. file:///tmp/picons)',
+        fieldLabel: 'Picon path<br/>(e.g. file:///tmp/picons or http://...)',
         width: 400
     });
 
@@ -143,7 +156,7 @@ tvheadend.miscconf = function(panel, index) {
         autoHeight: true,
         collapsible: true,
         animCollapse: true,
-        items: [piconPath]
+        items: [preferPicon, chiconPath, piconPath]
     });
 
     /*
@@ -214,6 +227,13 @@ tvheadend.miscconf = function(panel, index) {
         handler: saveChanges
     });
 
+    var imagecacheButton = new Ext.Button({
+        text: "Clean image (icon) cache",
+        tooltip: 'Clean image cache on storage',
+        iconCls: 'clean',
+        handler: cleanImagecache
+    });
+
     var helpButton = new Ext.Button({
         text: 'Help',
 		iconCls: 'help',
@@ -247,7 +267,7 @@ tvheadend.miscconf = function(panel, index) {
         bodyStyle: 'padding:15px',
         layout: 'form',
         items: _items,
-        tbar: [saveButton, '->', helpButton]
+        tbar: [saveButton, '-', imagecacheButton, '->', helpButton]
     });
 
     tvheadend.paneladd(panel, mpanel, index);
@@ -278,6 +298,18 @@ tvheadend.miscconf = function(panel, index) {
             });
     });
 
+    function saveChangesImagecache(params) {
+        if (imagecache_form)
+            imagecache_form.getForm().submit({
+                url: 'api/imagecache/config/save',
+                params: params || {},
+                waitMsg: 'Saving data...',
+                failure: function(form, action) {
+                    Ext.Msg.alert('Imagecache save failed', action.result.errormsg);
+                }
+            });
+    }
+
     function saveChanges() {
         confpanel.getForm().submit({
             url: 'config',
@@ -289,13 +321,10 @@ tvheadend.miscconf = function(panel, index) {
                 Ext.Msg.alert('Save failed', action.result.errormsg);
             }
         });
-        if (imagecache_form)
-            imagecache_form.getForm().submit({
-                url: 'api/imagecache/config/save',
-                waitMsg: 'Saving data...',
-                failure: function(form, action) {
-                    Ext.Msg.alert('Imagecache save failed', action.result.errormsg);
-                }
-            });
+        saveChangesImagecache();
+    }
+
+    function cleanImagecache() {
+        saveChangesImagecache({'clean': 1});
     }
 };

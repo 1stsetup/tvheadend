@@ -301,7 +301,7 @@ extjs_epggrab(http_connection_t *hc, const char *remain, void *opaque)
   uint32_t u32;
 
   if(op == NULL)
-    return 400;
+    return HTTP_STATUS_BAD_REQUEST;
 
   pthread_mutex_lock(&global_lock);
 
@@ -464,7 +464,7 @@ extjs_config(http_connection_t *hc, const char *remain, void *opaque)
   const char *str;
 
   if(op == NULL)
-    return 400;
+    return HTTP_STATUS_BAD_REQUEST;
 
   pthread_mutex_lock(&global_lock);
 
@@ -505,6 +505,10 @@ extjs_config(http_connection_t *hc, const char *remain, void *opaque)
       save |= config_set_muxconfpath(str);
     if ((str = http_arg_get(&hc->hc_req_args, "language")))
       save |= config_set_language(str);
+    if ((str = http_arg_get(&hc->hc_req_args, "prefer_picon")))
+      save |= config_set_prefer_picon(str);
+    if ((str = http_arg_get(&hc->hc_req_args, "chiconpath")))
+      save |= config_set_chicon_path(str);
     if ((str = http_arg_get(&hc->hc_req_args, "piconpath")))
       save |= config_set_picon_path(str);
     if (save)
@@ -545,7 +549,7 @@ extjs_tvhlog(http_connection_t *hc, const char *remain, void *opaque)
   htsmsg_t *out, *m;
 
   if(op == NULL)
-    return 400;
+    return HTTP_STATUS_BAD_REQUEST;
 
   pthread_mutex_lock(&global_lock);
 
@@ -650,7 +654,7 @@ extjs_timeshift(http_connection_t *hc, const char *remain, void *opaque)
   const char *str;
 
   if(op == NULL)
-    return 400;
+    return HTTP_STATUS_BAD_REQUEST;
 
   pthread_mutex_lock(&global_lock);
 

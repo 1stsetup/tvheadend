@@ -368,6 +368,19 @@ transcoder_stream_audio(transcoder_t *t, transcoder_stream_t *ts, th_pkt_t *pkt)
   ocodec = as->aud_ocodec;
 
   if (ictx->codec_id == AV_CODEC_ID_NONE) {
+
+    if (icodec->id == AV_CODEC_ID_AAC || icodec->id == AV_CODEC_ID_VORBIS) {
+      if (pkt->pkt_meta) {
+        ictx->extradata_size = pktbuf_len(pkt->pkt_meta);
+        ictx->extradata = av_malloc(ictx->extradata_size);
+        memcpy(ictx->extradata,
+               pktbuf_ptr(pkt->pkt_meta), pktbuf_len(pkt->pkt_meta));
+      } else {
+        /* wait for metadata */
+        return;
+      }
+    }
+
     ictx->codec_id = icodec->id;
 
     if (avcodec_open2(ictx, icodec, NULL) < 0) {
@@ -922,6 +935,19 @@ transcoder_stream_video(transcoder_t *t, transcoder_stream_t *ts, th_pkt_t *pkt)
   opts = NULL;
 
   if (ictx->codec_id == AV_CODEC_ID_NONE) {
+
+    if (icodec->id == AV_CODEC_ID_H264) {
+      if (pkt->pkt_meta) {
+        ictx->extradata_size = pktbuf_len(pkt->pkt_meta);
+        ictx->extradata = av_malloc(ictx->extradata_size);
+        memcpy(ictx->extradata,
+               pktbuf_ptr(pkt->pkt_meta), pktbuf_len(pkt->pkt_meta));
+      } else {
+        /* wait for metadata */
+        return;
+      }
+    }
+
     ictx->codec_id = icodec->id;
 
     if (avcodec_open2(ictx, icodec, NULL) < 0) {
@@ -932,6 +958,7 @@ transcoder_stream_video(transcoder_t *t, transcoder_stream_t *ts, th_pkt_t *pkt)
   }
 
   av_init_packet(&packet);
+
   packet.data     = pktbuf_ptr(pkt->pkt_payload);
   packet.size     = pktbuf_len(pkt->pkt_payload);
   packet.pts      = pkt->pkt_pts;
@@ -1212,6 +1239,8 @@ transcoder_destroy_subtitle(transcoder_t *t, transcoder_stream_t *ts)
   subtitle_stream_t *ss = (subtitle_stream_t*)ts;
 
   if(ss->sub_ictx) {
+    av_freep(&ss->sub_ictx->extradata);
+    ss->sub_ictx->extradata_size = 0;
     avcodec_close(ss->sub_ictx);
     av_free(ss->sub_ictx);
   }
@@ -1291,6 +1320,8 @@ transcoder_destroy_audio(transcoder_t *t, transcoder_stream_t *ts)
   audio_stream_t *as = (audio_stream_t*)ts;
 
   if(as->aud_ictx) {
+    av_freep(&as->aud_ictx->extradata);
+    as->aud_ictx->extradata_size = 0;
     avcodec_close(as->aud_ictx);
     av_free(as->aud_ictx);
   }
@@ -1393,6 +1424,8 @@ transcoder_destroy_video(transcoder_t *t, transcoder_stream_t *ts)
   video_stream_t *vs = (video_stream_t*)ts;
 
   if(vs->vid_ictx) {
+    av_freep(&vs->vid_ictx->extradata);
+    vs->vid_ictx->extradata_size = 0;
     avcodec_close(vs->vid_ictx);
     av_free(vs->vid_ictx);
   }

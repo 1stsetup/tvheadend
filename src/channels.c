@@ -42,6 +42,7 @@
 #include "imagecache.h"
 #include "service_mapper.h"
 #include "htsbuf.h"
+#include "intlconv.h"
 
 struct channel_tree channels;
 
@@ -292,6 +293,7 @@ const idclass_t channel_class = {
       .name     = "Name",
       .off      = offsetof(channel_t, ch_name),
       .get      = channel_class_get_name,
+      .notify   = channel_class_icon_notify, /* try to re-render default icon path */
     },
     {
       .type     = PT_S64,
@@ -532,28 +534,90 @@ channel_get_number ( channel_t *ch )
   return 0;
 }
 
+static int
+check_file( const char *url )
+{
+  if (url && !strncmp(url, "file://", 7))
+    return access(url + 7, R_OK) == 0;
+  return 1;
+}
+
 const char *
 channel_get_icon ( channel_t *ch )
 {
   static char buf[512], buf2[512];
   channel_service_mapping_t *csm;
-  const char *picon = config_get_picon_path(),
-             *icon  = ch->ch_icon;
-  uint32_t id;
+  const char *chicon = config_get_chicon_path(),
+             *picon  = config_get_picon_path(),
+             *icon   = ch->ch_icon,
+             *chname;
+  uint32_t id, i, pick, prefer = config_get_prefer_picon() ? 1 : 0;
 
-  /* No user icon - try access from services */
-  if (!icon && picon) {
-    LIST_FOREACH(csm, &ch->ch_services, csm_chn_link) {
-      if (!(icon = service_get_channel_icon(csm->csm_svc))) continue;
-      if (strncmp(icon, "picon://", 8)) {
-        icon = NULL;
-        continue;
+  if (icon && *icon == '\0')
+    icon = NULL;
+
+  /*
+   * 4 iterations:
+   * 0,1: try channel name or picon
+   * 2,3: force channel name or picon
+   */
+  for (i = 0; icon == NULL && i < 4; i++) {
+
+    pick = (i ^ prefer) & 1;
+
+    /* No user icon - try to get the channel icon by name */
+    if (!pick && chicon && chicon[0] >= ' ' && chicon[0] <= 122 &&
+        (chname = channel_get_name(ch)) != NULL && chname[0]) {
+      const char *chi, *send, *sname, *s;
+      chi = strdup(chicon);
+      send = strstr(chi, "%C");
+      if (send == NULL) {
+        buf[0] = '\0';
+        sname = "";
+      } else {
+        *(char *)send = '\0';
+        send += 2;
+        sname = intlconv_utf8safestr(intlconv_charset_id("ASCII", 1, 1),
+                                     chname, strlen(chname) * 2);
+        if (sname == NULL)
+          sname = strdup(chname);
+        /* Remove problematic characters */
+        s = sname;
+        while (s && *s) {
+          if (*s <= ' ' || *s > 122 ||
+              strchr("/:\\<>|*?'\"", *s) != NULL)
+            *(char *)s = '_';
+          s++;
+        }
       }
-      sprintf(buf2, "%s/%s", picon, icon+8);
-      ch->ch_icon = strdup(icon);
-      channel_save(ch);
-      idnode_notify_simple(&ch->ch_id);
+      snprintf(buf, sizeof(buf), "%s%s%s", chi, sname ?: "", send ?: "");
+      if (send)
+        free((char *)sname);
+      free((char *)chi);
+
+      if (i > 1 || check_file(buf)) {
+        icon = ch->ch_icon = strdup(buf);
+        channel_save(ch);
+        idnode_notify_simple(&ch->ch_id);
+      }
     }
+
+    /* No user icon - try access from services */
+    if (pick && picon) {
+      LIST_FOREACH(csm, &ch->ch_services, csm_chn_link) {
+        const char *icn;
+        if (!(icn = service_get_channel_icon(csm->csm_svc))) continue;
+        if (strncmp(icn, "picon://", 8))
+          continue;
+        snprintf(buf2, sizeof(buf2), "%s/%s", picon, icn+8);
+        if (i > 1 || check_file(buf2)) {
+          ch->ch_icon = strdup(icn);
+          channel_save(ch);
+          idnode_notify_simple(&ch->ch_id);
+        }
+      }
+    }
+
   }
 
   /* Nothing */

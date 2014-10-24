@@ -23,6 +23,7 @@
 #include "subscriptions.h"
 #include "channels.h"
 #include "access.h"
+#include "profile.h"
 #include "dvb_charset.h"
 
 #include <assert.h>
@@ -696,9 +697,10 @@ mpegts_mux_stop ( mpegts_mux_t *mm, int force )
   tvhdebug("mpegts", "%s - stopping mux", buf);
 
   if (mmi) {
+    mi = mmi->mmi_input;
+    mi->mi_stopping_mux(mi, mmi);
     LIST_FOREACH(sub, &mmi->mmi_subs, ths_mmi_link)
       subscription_unlink_mux(sub, SM_CODE_SUBSCRIPTION_OVERRIDDEN);
-    mi = mmi->mmi_input;
     mi->mi_stop_mux(mi, mmi);
     mi->mi_stopped_mux(mi, mmi);
   }
@@ -713,19 +715,26 @@ mpegts_mux_stop ( mpegts_mux_t *mm, int force )
     mpegts_input_flush_mux(mi, mm);
 
   /* Ensure PIDs are cleared */
-  mm->mm_last_pid = -1;
-  mm->mm_last_mp = NULL;
-  while ((mp = RB_FIRST(&mm->mm_pids))) {
-    while ((mps = RB_FIRST(&mp->mp_subs))) {
-      RB_REMOVE(&mp->mp_subs, mps, mps_link);
-      free(mps);
+  if (mi) {
+    pthread_mutex_lock(&mi->mi_output_lock);
+    mm->mm_last_pid = -1;
+    mm->mm_last_mp = NULL;
+    while ((mp = RB_FIRST(&mm->mm_pids))) {
+      assert(mi);
+      while ((mps = RB_FIRST(&mp->mp_subs))) {
+        RB_REMOVE(&mp->mp_subs, mps, mps_link);
+        free(mps);
+      }
+      RB_REMOVE(&mm->mm_pids, mp, mp_link);
+      if (mp->mp_fd != -1) {
+        tvhdebug("mpegts", "%s - close PID %04X (%d)", buf, mp->mp_pid, mp->mp_pid);
+        close(mp->mp_fd);
+      }
+      free(mp);
     }
-    RB_REMOVE(&mm->mm_pids, mp, mp_link);
-    if (mp->mp_fd != -1) {
-      tvhdebug("mpegts", "%s - close PID %04X (%d)", buf, mp->mp_pid, mp->mp_pid);
-      close(mp->mp_fd);
-    }
-    free(mp);
+    pthread_mutex_unlock(&mi->mi_output_lock);
+  } else {
+    assert(RB_FIRST(&mm->mm_pids) == NULL);
   }
 
   /* Scanning */
@@ -769,6 +778,7 @@ mpegts_mux_open_table ( mpegts_mux_t *mm, mpegts_table_t *mt, int subscribe )
   mi = mm->mm_active->mmi_input;
   LIST_INSERT_HEAD(&mm->mm_tables, mt, mt_link);
   mm->mm_num_tables++;
+  mpegts_table_grab(mt);
   pthread_mutex_unlock(&mm->mm_tables_lock);
   pthread_mutex_lock(&mi->mi_output_lock);
   if (subscribe) {
@@ -777,6 +787,7 @@ mpegts_mux_open_table ( mpegts_mux_t *mm, mpegts_table_t *mt, int subscribe )
   }
   pthread_mutex_unlock(&mi->mi_output_lock);
   pthread_mutex_lock(&mm->mm_tables_lock);
+  mpegts_table_release(mt);
 }
 
 void
@@ -790,6 +801,7 @@ mpegts_mux_close_table ( mpegts_mux_t *mm, mpegts_table_t *mt )
     if (mt->mt_defer_cmd) {
       TAILQ_REMOVE(&mm->mm_defer_tables, mt, mt_defer_link);
       mt->mt_defer_cmd = 0;
+      mpegts_table_release(mt);
     }
     mt->mt_subscribed = 0;
     LIST_REMOVE(mt, mt_link);
@@ -815,6 +827,7 @@ mpegts_mux_close_table ( mpegts_mux_t *mm, mpegts_table_t *mt )
   mi = mm->mm_active->mmi_input;
   LIST_REMOVE(mt, mt_link);
   mm->mm_num_tables--;
+  mpegts_table_grab(mt);
   pthread_mutex_unlock(&mm->mm_tables_lock);
   pthread_mutex_lock(&mi->mi_output_lock);
   if (mt->mt_subscribed) {
@@ -823,6 +836,7 @@ mpegts_mux_close_table ( mpegts_mux_t *mm, mpegts_table_t *mt )
   }
   pthread_mutex_unlock(&mi->mi_output_lock);
   pthread_mutex_lock(&mm->mm_tables_lock);
+  mpegts_table_release(mt);
 }
 
 /* **************************************************************************
@@ -838,6 +852,7 @@ mpegts_mux_scan_done ( mpegts_mux_t *mm, const char *buf, int res )
 
   /* Log */
   pthread_mutex_lock(&mm->mm_tables_lock);
+  mpegts_table_consistency_check(mm);
   LIST_FOREACH(mt, &mm->mm_tables, mt_link) {
     if (mt->mt_flags & MT_QUICKREQ) {
       const char *s = "not found";
@@ -862,7 +877,7 @@ mpegts_mux_scan_timeout ( void *aux )
   int c, q;
   char buf[256];
   mpegts_mux_t *mm = aux;
-  mpegts_table_t *mt, *nxt;
+  mpegts_table_t *mt;
   mpegts_mux_nice_name(mm, buf, sizeof(buf));
 
   /* Timeout */
@@ -876,13 +891,15 @@ mpegts_mux_scan_timeout ( void *aux )
   /* Check tables */
 again:
   pthread_mutex_lock(&mm->mm_tables_lock);
+  mpegts_table_consistency_check(mm);
   c = q = 0;
-  for (mt = LIST_FIRST(&mm->mm_tables); mt != NULL; mt = nxt) {
-    nxt = LIST_NEXT(mt, mt_link);
+  LIST_FOREACH(mt, &mm->mm_tables, mt_link) {
     if (!(mt->mt_flags & MT_QUICKREQ)) continue;
     if (!mt->mt_count) {
+      mpegts_table_grab(mt);
       pthread_mutex_unlock(&mm->mm_tables_lock);
       mpegts_table_destroy(mt);
+      mpegts_table_release(mt);
       goto again;
     } else if (!mt->mt_complete) {
       q++;
@@ -1074,8 +1091,11 @@ mpegts_mux_subscribe
   ( mpegts_mux_t *mm, const char *name, int weight )
 {
   int err = 0;
+  profile_chain_t prch;
   th_subscription_t *s;
-  s = subscription_create_from_mux(mm, NULL, weight, name, NULL,
+  memset(&prch, 0, sizeof(prch));
+  prch.prch_id = mm;
+  s = subscription_create_from_mux(&prch, weight, name,
                                    SUBSCRIPTION_NONE,
                                    NULL, NULL, NULL, &err);
   return s ? 0 : err;
